@@ -14,7 +14,11 @@ onnxruntime==1.19.0
 # numpy==1.26.3
 librosa==0.10.2.post1
 flask==3.0.3
+flask-cors==4.0.0
 fire
 git+https://github.com/mini-omni/CLIP.git
 gradio_webrtc[vad]==0.0.11
 twilio
+aiohttp==3.9.1
+aiohttp-cors==0.7.0
+requests==2.31.0
