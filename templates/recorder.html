@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Simple Audio Recorder</title>
+  <style>
+    :root {
+      --gap: 24px;
+      --panel-bg: #ffffff;
+      --panel-border: #e5e7eb;
+    }
+    body { font-family: Arial, sans-serif; margin: 24px; background: #f8fafc; }
+    .container { max-width: 1400px; margin: 0 auto; }
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); align-items: start; }
+    .panel { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 20px; min-height: 480px; }
+    .panel h1, .panel h2 { margin: 0 0 12px; }
+
+    .controls { display: flex; gap: 12px; margin: 16px 0; flex-wrap: wrap; }
+    button { padding: 10px 16px; border: none; border-radius: 6px; cursor: pointer; }
+    button#startBtn { background: #28a745; color: white; }
+    button#stopBtn { background: #dc3545; color: white; }
+    button#playAnswerBtn { background: #007bff; color: white; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .placeholders { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 8px 0 16px; }
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field label { font-size: 0.9rem; color: #334155; }
+    .field input { padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.95rem; }
+
+    .log { background: #f8f9fa; border: 1px solid #e9ecef; padding: 12px; border-radius: 6px; white-space: pre-wrap; min-height: 120px; }
+    audio { width: 100%; margin-top: 12px; }
+    .status { padding: 8px 12px; border-radius: 6px; margin: 8px 0; }
+    .status.ok { background: #d4edda; color: #155724; }
+    .status.err { background: #f8d7da; color: #721c24; }
+    .section-title { margin-top: 18px; margin-bottom: 6px; font-weight: bold; }
+
+    /* Right panel placeholder */
+    .placeholder { display: flex; align-items: center; justify-content: center; height: 100%; min-height: 300px; color: #6b7280; border: 2px dashed #cbd5e1; border-radius: 8px; background: #f9fafb; }
+
+    @media (max-width: 960px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="layout">
+      <!-- Left Panel: Main controls/content -->
+      <div class="panel" id="leftPanel">
+        <h1>Audio Recorder</h1>
+        <p>Record your audio and it will be saved to the server when you press Stop.</p>
+
+        <div id="health" class="status">Checking server...</div>
+
+        <div class="controls">
+          <button id="startBtn">Start Recording</button>
+          <button id="stopBtn" disabled>Stop</button>
+          <button id="playAnswerBtn" disabled>Play Answer</button>
+        </div>
+
+        <!-- Placeholder inputs (not wired yet) -->
+        <div class="placeholders" aria-label="Placeholder parameters (no function yet)">
+          <div class="field">
+            <label for="fpsInput">FPS (placeholder)</label>
+            <input id="fpsInput" type="number" min="1" max="60" step="1" value="30" placeholder="30" />
+          </div>
+          <div class="field">
+            <label for="batchInput">Batch Size (placeholder)</label>
+            <input id="batchInput" type="number" min="1" step="1" value="64" placeholder="64" />
+          </div>
+        </div>
+
+        <div class="section-title">Answer</div>
+        <audio id="answerPlayer" controls></audio>
+
+        <h3>Log</h3>
+        <div id="log" class="log"></div>
+      </div>
+
+      <!-- Right Panel: Musetalk placeholder -->
+      <div class="panel" id="rightPanel">
+        <h2>Musetalk</h2>
+        <div class="placeholder">musetalk stream here</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    function clearLog() { logEl.textContent = ''; }
+    function log(msg) { logEl.textContent += msg + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+
+    const healthEl = document.getElementById('health');
+    fetch('/health').then(r => r.json()).then(d => {
+      healthEl.textContent = `Server OK. Recordings dir: ${d.recordings_dir || 'unknown'}`;
+      healthEl.className = 'status ok';
+    }).catch(err => {
+      healthEl.textContent = `Server health check failed: ${err}`;
+      healthEl.className = 'status err';
+    });
+
+    let mediaRecorder = null;
+    let chunks = [];
+    let startTime = 0;
+
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const playAnswerBtn = document.getElementById('playAnswerBtn');
+    const answerPlayer = document.getElementById('answerPlayer');
+
+    let answerUrl = '';
+
+    async function startRecording() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        chunks = [];
+        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+        mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+        mediaRecorder.onstop = async () => {
+          const blob = new Blob(chunks, { type: 'audio/webm' });
+
+          clearLog();
+          const tUploadStart = performance.now();
+
+          const uploadName = 'UserInput.webm';
+          const formData = new FormData();
+          formData.append('file', blob, uploadName);
+          formData.append('mimeType', blob.type);
+          formData.append('duration', ((Date.now() - startTime) / 1000).toFixed(2));
+
+          try {
+            const resp = await fetch('/upload_audio', { method: 'POST', body: formData });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const data = await resp.json();
+
+            const inferenceMs = data.metrics && typeof data.metrics.inference_ms === 'number' ? data.metrics.inference_ms : null;
+
+            if (data.answer && data.answer.answer_url) {
+              answerUrl = data.answer.answer_url;
+              await new Promise((resolve) => {
+                const onReady = () => { answerPlayer.removeEventListener('canplaythrough', onReady); resolve(); };
+                answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
+                answerPlayer.src = answerUrl + `?t=${Date.now()}`;
+              });
+              const totalDelayMs = Math.max(0, Math.round(performance.now() - tUploadStart));
+              if (typeof inferenceMs === 'number') log(`inference_time_ms: ${inferenceMs}`);
+              log(`total_delay_ms: ${totalDelayMs}`);
+              playAnswerBtn.disabled = false;
+            } else {
+              if (typeof inferenceMs === 'number') log(`inference_time_ms: ${inferenceMs}`);
+              log('total_delay_ms: N/A');
+            }
+          } catch (err) {
+            log('inference_time_ms: N/A');
+            log('total_delay_ms: N/A');
+          }
+        };
+        mediaRecorder.start(250);
+        startTime = Date.now();
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        playAnswerBtn.disabled = true;
+      } catch (err) {
+        clearLog();
+        log('inference_time_ms: N/A');
+        log('total_delay_ms: N/A');
+      }
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+        mediaRecorder.stream.getTracks().forEach(t => t.stop());
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      }
+    }
+
+    function playAnswer() {
+      if (!answerUrl) return;
+      if (answerPlayer.src !== answerUrl) {
+        answerPlayer.src = answerUrl + `?t=${Date.now()}`;
+      }
+      answerPlayer.play().catch(() => {});
+    }
+
+    startBtn.addEventListener('click', startRecording);
+    stopBtn.addEventListener('click', stopRecording);
+    playAnswerBtn.addEventListener('click', playAnswer);
+  </script>
+</body>
+</html>
