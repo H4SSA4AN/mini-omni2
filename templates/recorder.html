@@ -11,8 +11,8 @@
       --panel-border: #e5e7eb;
     }
     body { font-family: Arial, sans-serif; margin: 24px; background: #f8fafc; }
-    .container { max-width: 1400px; margin: 0 auto; }
-    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); align-items: start; }
+    .container { max-width: 1600px; margin: 0 auto; }
+    .layout { display: grid; grid-template-columns: 1fr 1.5fr; gap: var(--gap); align-items: start; }
     .panel { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 20px; min-height: 480px; }
     .panel h1, .panel h2 { margin: 0 0 12px; }
 
@@ -59,15 +59,15 @@
           <button id="playAnswerBtn" disabled>Play Answer</button>
         </div>
 
-        <!-- Placeholder inputs (not wired yet) -->
-        <div class="placeholders" aria-label="Placeholder parameters (no function yet)">
+        <!-- FPS and Batch Size inputs -->
+        <div class="placeholders" aria-label="Inference parameters">
           <div class="field">
-            <label for="fpsInput">FPS (placeholder)</label>
-            <input id="fpsInput" type="number" min="1" max="60" step="1" value="30" placeholder="30" />
+            <label for="fpsInput">FPS</label>
+            <input id="fpsInput" type="number" min="1" max="60" step="1" value="25" />
           </div>
           <div class="field">
-            <label for="batchInput">Batch Size (placeholder)</label>
-            <input id="batchInput" type="number" min="1" step="1" value="64" placeholder="64" />
+            <label for="batchInput">Batch Size</label>
+            <input id="batchInput" type="number" min="1" step="1" value="8" />
           </div>
         </div>
 
@@ -86,10 +86,19 @@
           <input id="musetalkUrl" type="text" placeholder="http://localhost:7860/health or full endpoint" />
         </div>
         <div class="controls" style="margin-top: 8px;">
-          <button id="checkMusetalkBtn">Check Connection</button>
+            <button id="checkMusetalkBtn">Check Connection</button>
         </div>
         <div id="musetalkStatus" class="status">Not checked</div>
-        <div class="placeholder" style="margin-top: 12px;">musetalk stream here</div>
+        <div class="placeholder" style="margin-top: 12px;">
+            <!-- Canvas for rendering frames -->
+            <canvas id="musetalkCanvas" width="960" height="720" style="max-width:100%; height:auto; background:#000; border-radius:8px; display:none;"></canvas>
+            <div id="musetalkPlaceholder" style="display:flex; align-items:center; justify-content:center; min-height:480px; color:#6b7280; border:2px dashed #cbd5e1; border-radius:8px; background:#f9fafb;">
+                <div style="text-align:center;">
+                    <div style="font-size:1.2em; margin-bottom:8px;">🎭 MuseTalk Avatar</div>
+                    <div style="font-size:0.9em;">Lip-synced video will appear here</div>
+                </div>
+            </div>
+        </div>
       </div>
     </div>
   </div>
@@ -123,6 +132,10 @@
     const musetalkUrlInput = document.getElementById('musetalkUrl');
     const checkMusetalkBtn = document.getElementById('checkMusetalkBtn');
     const musetalkStatusEl = document.getElementById('musetalkStatus');
+    const musetalkCanvas = document.getElementById('musetalkCanvas');
+    const musetalkPlaceholderEl = document.getElementById('musetalkPlaceholder');
+    let t1_stopClickTime = 0; // T1: Timestamp for when the user clicks stop. Shared across functions.
+    let t4_inferenceEndTime = 0; // T4: Timestamp for when inference finishes. Polled from server.
 
     function setMusetalkStatusOk(text) {
       musetalkStatusEl.textContent = text;
@@ -179,9 +192,275 @@
       if (saved) musetalkUrlInput.value = saved;
     })();
 
-    checkMusetalkBtn.addEventListener('click', checkMusetalkConnection);
+    checkMusetalkBtn.addEventListener('click', async () => {
+      await checkMusetalkConnection();
+      // Connect only after the user explicitly checks connection
+      await connectMusetalk();
+    });
+
+    // MJPEG streaming with MuseTalk server
+    let mjpegStream = null;
+    let connecting = false;
+
+    // This will hold the AbortController to cancel an ongoing fetch stream
+    let streamController = null;
+
+    function ensureStreamUrl(raw) {
+      const u = normalizeUrl(raw);
+      if (!u) return '';
+      // If user pasted health or root, default to /stream
+      try {
+        const url = new URL(u);
+        if (url.pathname === '/' || url.pathname === '/health') {
+          url.pathname = '/stream';
+        }
+        return url.toString();
+      } catch {
+        return '';
+      }
+    }
+
+    async function connectMusetalk(fps = 25) {
+      if (connecting) return;
+      const raw = musetalkUrlInput.value;
+      const streamUrl = ensureStreamUrl(raw);
+      if (!streamUrl) {
+        setMusetalkStatusErr('Please enter a valid MuseTalk server URL');
+        return;
+      }
+      connecting = true;
+      setMusetalkStatusOk('Connecting to stream...');
+      log(`Connecting to stream for manual rendering at ${fps} FPS`);
+
+      const canvas = musetalkCanvas;
+      const ctx = canvas.getContext('2d');
+      canvas.style.display = 'block';
+      musetalkPlaceholderEl.style.display = 'none';
+
+      // Set canvas display size
+      const displayWidth = canvas.parentElement.clientWidth;
+      const displayHeight = (displayWidth / canvas.width) * canvas.height;
+      canvas.style.height = `${displayHeight}px`;
+
+      try {
+        streamController = new AbortController();
+        const signal = streamController.signal;
+
+        const response = await fetch(streamUrl, { signal });
+        if (!response.ok) {
+          throw new Error(`Connection failed: ${response.status} ${response.statusText}`);
+        }
+        
+        log('Stream connected. Parsing frames...');
+        setMusetalkStatusOk('Connected. Parsing frames...');
+
+        const reader = response.body.getReader();
+        let buffer = new Uint8Array();
+        const SOI = new Uint8Array([0xFF, 0xD8]); // Start of Image
+        const EOI = new Uint8Array([0xFF, 0xD9]); // End of Image
+        let frameCount = 0;
+
+        function findMarker(data, marker) {
+            for (let i = 0; i < data.length - marker.length + 1; i++) {
+                let found = true;
+                for (let j = 0; j < marker.length; j++) {
+                    if (data[i + j] !== marker[j]) {
+                        found = false;
+                        break;
+                    }
+                }
+                if (found) return i;
+            }
+            return -1;
+        }
+
+        // We use requestAnimationFrame for smoother, more efficient rendering
+        let lastFrameTime = 0;
+        const frameDuration = 1000 / fps;
+        let frameQueue = [];
+
+        function renderLoop(timestamp) {
+            if (!lastFrameTime) lastFrameTime = timestamp;
+            let elapsed = timestamp - lastFrameTime;
+
+            if (elapsed > frameDuration && frameQueue.length > 0) {
+                const frameData = frameQueue.shift();
+                const blob = new Blob([frameData], { type: 'image/jpeg' });
+                const imageUrl = URL.createObjectURL(blob);
+                const img = new Image();
+
+                img.onload = () => {
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    URL.revokeObjectURL(imageUrl); // Clean up memory
+
+                    if (frameCount === 0) {
+                        const t3_firstFrameTime = performance.now(); // T3: First frame displayed
+                        if (t1_stopClickTime > 0) {
+                            log(`>>> Total time to first frame (T3-T1): ${Math.round(t3_firstFrameTime - t1_stopClickTime)} ms`);
+                        }
+                        log('First frame rendered, playing audio...');
+                        playAnswer();
+                    }
+
+                    frameCount++;
+                    // Only update status, no per-frame log
+                    setMusetalkStatusOk(`Displayed frame: ${frameCount}`);
+                };
+                img.onerror = () => {
+                    log(`Error loading image for frame ${frameCount + 1}`);
+                    URL.revokeObjectURL(imageUrl);
+                };
+                img.src = imageUrl;
+                lastFrameTime = timestamp;
+            }
+            requestAnimationFrame(renderLoop);
+        }
+        
+        requestAnimationFrame(renderLoop);
+
+        async function processFrames() {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    const t5_streamEndTime = performance.now(); // T5: Stream display ends
+                    if (t4_inferenceEndTime > 0) {
+                        // Server time is in seconds, client is in ms. Convert T4 to ms.
+                        const t4_ms = t4_inferenceEndTime * 1000;
+                        // We need a common reference. Let's use the time since T1.
+                        const t5_relative = t5_streamEndTime - t1_stopClickTime;
+                        const t4_relative = t4_ms - (performance.timeOrigin + t1_stopClickTime);
+                        // This calculation is complex due to different clocks. Let's log what we have.
+                        log(`Stream display finished.`);
+                        log(`>>> Stream drain time (T5-T4): (See poll logs for T4)`);
+                    } else {
+                        log('Stream finished.');
+                    }
+                    setMusetalkStatusOk(`Stream ended. Total frames displayed: ${frameCount}`);
+                    break;
+                }
+
+                // Add new data to buffer
+                const newBuffer = new Uint8Array(buffer.length + value.length);
+                newBuffer.set(buffer);
+                newBuffer.set(value, buffer.length);
+                buffer = newBuffer;
+
+                // Process all complete JPEGs in the buffer
+                while (true) {
+                    const soiIndex = findMarker(buffer, SOI);
+                    if (soiIndex === -1) break; // No start marker found, wait for more data
+
+                    const eoiIndex = findMarker(buffer.subarray(soiIndex), EOI);
+                    if (eoiIndex === -1) break; // No end marker found, wait for more data
+
+                    const frameData = buffer.subarray(soiIndex, soiIndex + eoiIndex + EOI.length);
+                    frameQueue.push(frameData);
+
+                    // Remove processed frame from buffer
+                    buffer = buffer.subarray(soiIndex + eoiIndex + EOI.length);
+                }
+            }
+        }
+        await processFrames();
+
+      } catch (e) {
+        if (e.name === 'AbortError') {
+            log('Stream connection aborted for new recording.');
+        } else {
+            setMusetalkStatusErr('Stream failed: ' + e.message);
+            log('Error processing stream: ' + e.message);
+            canvas.style.display = 'none';
+            musetalkPlaceholderEl.style.display = 'flex';
+        }
+      } finally {
+        connecting = false;
+        streamController = null;
+      }
+    }
+
+    // Poll for stream readiness
+    async function pollForStreamReady(musetalkUrl) {
+      const baseUrl = normalizeUrl(musetalkUrl).replace('/stream', '').replace('/health', '');
+      const statusUrl = baseUrl + '/stream_status';
+      
+      let attempts = 0;
+      const maxAttempts = 120; // 60 seconds with 500ms intervals
+      let streamConnected = false;
+      
+      const poll = async () => {
+        if (streamConnected) return; // Stop polling once connected
+
+        try {
+          const response = await fetch(statusUrl);
+          const data = await response.json();
+
+          // Continuously update T4 when available
+          if (data.inference_end_time) {
+              t4_inferenceEndTime = data.inference_end_time;
+              log(`(Poll) Inference finished at server time: ${t4_inferenceEndTime}`);
+          }
+          
+          if (!streamConnected && (data.inference_triggered || data.stream_ready)) {
+            streamConnected = true; // Prevent multiple connection attempts
+            log('MuseTalk inference triggered, connecting to stream...');
+            const inferenceFps = data.fps || 25; // Use server FPS, fallback to 25
+            log(`Server is generating frames at ${inferenceFps} FPS.`);
+            connectMusetalk(inferenceFps);
+            // Don't return, allow polling to continue for T4
+          }
+          
+          attempts++;
+          if (attempts < maxAttempts) {
+            setTimeout(poll, 500);
+          } else {
+            log('MuseTalk polling stopped after 60 seconds');
+          }
+        } catch (error) {
+          log('Error polling stream status: ' + error.message);
+          attempts++;
+          if (attempts < maxAttempts) {
+            setTimeout(poll, 1000);
+          }
+        }
+      };
+      
+      poll();
+    }
+
+    // Persist URL but do not auto-connect
+    musetalkUrlInput.addEventListener('blur', () => {
+      localStorage.setItem('musetalkUrl', musetalkUrlInput.value);
+    });
 
     async function startRecording() {
+      // If a stream is in progress, abort it.
+      if (streamController) {
+          streamController.abort();
+      }
+
+      // Reset the MuseTalk server state before starting a new session
+      const rawUrl = musetalkUrlInput.value;
+      if (rawUrl) {
+          const baseUrl = normalizeUrl(rawUrl).replace('/stream', '').replace('/health', '');
+          try {
+              log('Resetting MuseTalk server state...');
+              await fetch(`${baseUrl}/reset`, { method: 'POST' });
+          } catch (e) {
+              log(`Could not reset MuseTalk server: ${e.message}`);
+          }
+      }
+
+      // Reset UI elements for the new recording session
+      clearLog();
+      setMusetalkStatusOk('Ready for new recording...');
+      musetalkCanvas.style.display = 'none';
+      musetalkPlaceholderEl.style.display = 'flex';
+      connecting = false;
+      t1_stopClickTime = 0;
+      answerUrl = '';
+      playAnswerBtn.disabled = true;
+      answerPlayer.src = '';
+
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         chunks = [];
@@ -191,13 +470,18 @@
           const blob = new Blob(chunks, { type: 'audio/webm' });
 
           clearLog();
-          const tUploadStart = performance.now();
+          log('Audio processing started...');
+          t1_stopClickTime = performance.now(); // T1: User clicks stop
 
           const uploadName = 'UserInput.webm';
           const formData = new FormData();
           formData.append('file', blob, uploadName);
           formData.append('mimeType', blob.type);
           formData.append('duration', ((Date.now() - startTime) / 1000).toFixed(2));
+          // Pass musetalk url and inference params to the new endpoint
+          formData.append('musetalkUrl', musetalkUrlInput.value || '');
+          formData.append('fps', document.getElementById('fpsInput').value);
+          formData.append('batch_size', document.getElementById('batchInput').value);
 
           try {
             const resp = await fetch('/upload_audio', { method: 'POST', body: formData });
@@ -213,9 +497,17 @@
                 answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
                 answerPlayer.src = answerUrl + `?t=${Date.now()}`;
               });
-              const totalDelayMs = Math.max(0, Math.round(performance.now() - tUploadStart));
-              if (typeof inferenceMs === 'number') log(`inference_time_ms: ${inferenceMs}`);
-              log(`total_delay_ms: ${totalDelayMs}`);
+              const t2_serverResponseTime = performance.now(); // T2: Server response received
+              log(`Server processing time (T2-T1): ${Math.round(t2_serverResponseTime - t1_stopClickTime)} ms`);
+              
+              // If forwarding was successful, start polling for stream readiness
+              if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
+                log('Audio processing complete. Polling for MuseTalk stream...');
+                pollForStreamReady(musetalkUrlInput.value);
+              } else {
+                const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
+                setMusetalkStatusErr(`MuseTalk trigger failed: ${errorMsg}`);
+              }
               playAnswerBtn.disabled = false;
             } else {
               if (typeof inferenceMs === 'number') log(`inference_time_ms: ${inferenceMs}`);

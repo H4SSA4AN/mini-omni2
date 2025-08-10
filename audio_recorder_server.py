@@ -84,6 +84,58 @@ def _init_omni() -> None:
         raise
 
 
+def _normalize_musetalk_upload_url(url: str) -> str:
+    try:
+        from urllib.parse import urlparse, urlunparse
+        p = urlparse(url)
+        # If no scheme, assume http
+        scheme = p.scheme or 'http'
+        netloc = p.netloc or p.path  # handle bare host without scheme
+        path = '/upload_answer'
+        return urlunparse((scheme, netloc, path, '', '', ''))
+    except Exception:
+        return url.rstrip('/') + '/upload_answer'
+
+def _normalize_musetalk_start_url(url: str) -> str:
+    try:
+        from urllib.parse import urlparse, urlunparse
+        p = urlparse(url)
+        scheme = p.scheme or 'http'
+        netloc = p.netloc or p.path
+        path = '/start'
+        return urlunparse((scheme, netloc, path, '', '', ''))
+    except Exception:
+        return url.rstrip('/') + '/start'
+
+
+def _forward_answer_and_trigger_inference(answer_path: Path, musetalk_url: str, fps: int, batch_size: int) -> dict:
+    """
+    1. POST the generated Answer.wav to MuseTalk server's /upload_answer.
+    2. POST to MuseTalk server's /start to trigger inference with custom params.
+    """
+    try:
+        # Step 1: Upload the audio file
+        upload_url = _normalize_musetalk_upload_url(musetalk_url)
+        files = {'file': ('Answer.wav', open(answer_path, 'rb'), 'audio/wav')}
+        upload_resp = requests.post(upload_url, files=files, timeout=10)
+        
+        if not upload_resp.ok:
+            return {"ok": False, "step": "upload", "status": upload_resp.status_code, "text": upload_resp.text}
+        
+        # Step 2: Trigger inference with parameters
+        start_url = _normalize_musetalk_start_url(musetalk_url)
+        payload = {"fps": fps, "batch_size": batch_size}
+        start_resp = requests.post(start_url, json=payload, timeout=10)
+
+        if not start_resp.ok:
+            return {"ok": False, "step": "start", "status": start_resp.status_code, "text": start_resp.text}
+            
+        return {"ok": True, "upload_response": upload_resp.json(), "start_response": start_resp.json()}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # Clear the recordings folder on startup
 _clear_dir(RECORDINGS_DIR)
 
@@ -201,6 +253,13 @@ def upload_audio():
 
     mime_type = request.form.get("mimeType", "")
     duration = request.form.get("duration", "")
+    musetalk_url = request.form.get("musetalkUrl", "").strip()
+    try:
+        fps = int(request.form.get("fps", 25))
+        batch_size = int(request.form.get("batch_size", 8))
+    except (ValueError, TypeError):
+        fps = 25
+        batch_size = 8
 
     _clear_dir(RECORDINGS_DIR)
     wav_path = RECORDINGS_DIR / "UserInput.wav"
@@ -244,6 +303,19 @@ def upload_audio():
         return jsonify({"error": f"Inference failed: {e}"}), 500
     inference_ms = int((time.time() - infer_start) * 1000)
 
+    # Optionally forward the answer to MuseTalk server if URL provided by client
+    forward_info = None
+    if musetalk_url:
+        try:
+            forward_info = _forward_answer_and_trigger_inference(
+                Path(inference_result["answer_path"]), 
+                musetalk_url,
+                fps,
+                batch_size
+            )
+        except Exception as e:
+            forward_info = {"ok": False, "error": str(e)}
+
     return jsonify({
         "status": "saved",
         "user_input": {
@@ -255,6 +327,7 @@ def upload_audio():
             "size_bytes": file_size,
         },
         "answer": inference_result,
+        "forwarded_to_musetalk": forward_info,
         "metrics": {
             "saved_at_ms": saved_at_ms,
             "inference_ms": inference_ms
@@ -284,6 +357,61 @@ def serve_answer(filename: str):
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
+
+
+@app.route("/musetalk_stream_ready", methods=["POST"])
+def musetalk_stream_ready():
+    """Receive notification from MuseTalk that streaming is ready"""
+    try:
+        data = request.get_json()
+        if data and data.get("status") == "ready":
+            stream_url = data.get("stream_url")
+            print(f"[Mini-Omni] MuseTalk stream ready: {stream_url}")
+            return jsonify({"ok": True, "message": "Stream notification received"})
+        else:
+            return jsonify({"ok": False, "error": "Invalid notification data"}), 400
+    except Exception as e:
+        print(f"[Mini-Omni] Error handling stream notification: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+
+
+@app.route("/musetalk_webrtc_offer", methods=["POST"])
+def musetalk_webrtc_offer():
+    """Proxy an SDP offer to a MuseTalk WebRTC server to avoid browser CORS issues.
+
+    Request JSON:
+      {
+        "offer_url": "http://localhost:8090/offer",
+        "sdp": "...",
+        "type": "offer"
+      }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        offer_url = (data.get("offer_url") or "").strip()
+        sdp = data.get("sdp")
+        sdp_type = data.get("type") or "offer"
+        if not offer_url:
+            return jsonify({"ok": False, "error": "offer_url required"}), 400
+        if not sdp:
+            return jsonify({"ok": False, "error": "sdp required"}), 400
+        # Forward
+        try:
+            resp = requests.post(offer_url, json={"sdp": sdp, "type": sdp_type}, timeout=10)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"request error: {e}"}), 502
+        if not resp.ok:
+            return jsonify({"ok": False, "status": resp.status_code, "text": resp.text}), 502
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"sdp": resp.text, "type": "answer"}
+        return jsonify({"ok": True, "answer": payload}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
