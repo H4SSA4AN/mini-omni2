@@ -81,7 +81,15 @@
       <!-- Right Panel: Musetalk placeholder -->
       <div class="panel" id="rightPanel">
         <h2>Musetalk</h2>
-        <div class="placeholder">musetalk stream here</div>
+        <div class="field">
+          <label for="musetalkUrl">Musetalk Server URL</label>
+          <input id="musetalkUrl" type="text" placeholder="http://localhost:7860/health or full endpoint" />
+        </div>
+        <div class="controls" style="margin-top: 8px;">
+          <button id="checkMusetalkBtn">Check Connection</button>
+        </div>
+        <div id="musetalkStatus" class="status">Not checked</div>
+        <div class="placeholder" style="margin-top: 12px;">musetalk stream here</div>
       </div>
     </div>
   </div>
@@ -110,6 +118,68 @@
     const answerPlayer = document.getElementById('answerPlayer');
 
     let answerUrl = '';
+
+    // Musetalk URL handling and connectivity check
+    const musetalkUrlInput = document.getElementById('musetalkUrl');
+    const checkMusetalkBtn = document.getElementById('checkMusetalkBtn');
+    const musetalkStatusEl = document.getElementById('musetalkStatus');
+
+    function setMusetalkStatusOk(text) {
+      musetalkStatusEl.textContent = text;
+      musetalkStatusEl.className = 'status ok';
+    }
+
+    function setMusetalkStatusErr(text) {
+      musetalkStatusEl.textContent = text;
+      musetalkStatusEl.className = 'status err';
+    }
+
+    function normalizeUrl(url) {
+      const u = (url || '').trim();
+      if (!u) return '';
+      if (/^https?:\/\//i.test(u)) return u;
+      return 'http://' + u;
+    }
+
+    async function checkMusetalkConnection() {
+      const raw = musetalkUrlInput.value;
+      const url = normalizeUrl(raw);
+      if (!url) {
+        setMusetalkStatusErr('Please enter a URL');
+        return;
+      }
+      localStorage.setItem('musetalkUrl', raw);
+      checkMusetalkBtn.disabled = true;
+      musetalkStatusEl.className = 'status';
+      musetalkStatusEl.textContent = 'Checking...';
+      try {
+        const resp = await fetch('/check_musetalk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        const data = await resp.json();
+        if (data.ok) {
+          const ms = typeof data.elapsed_ms === 'number' ? `${data.elapsed_ms} ms` : 'N/A';
+          setMusetalkStatusOk(`Connected: ${data.url || url} [${data.status}] in ${ms}`);
+        } else {
+          const detail = data.tried && data.tried.length ? ` Tried: ${data.tried.map(t => t.url + (t.status ? `(${t.status})` : '')).join(', ')}` : '';
+          setMusetalkStatusErr('Connection failed.' + detail);
+        }
+      } catch (e) {
+        setMusetalkStatusErr('Connection check error');
+      } finally {
+        checkMusetalkBtn.disabled = false;
+      }
+    }
+
+    // Initialize musetalk URL from localStorage
+    (function initMusetalkUrl() {
+      const saved = localStorage.getItem('musetalkUrl') || '';
+      if (saved) musetalkUrlInput.value = saved;
+    })();
+
+    checkMusetalkBtn.addEventListener('click', checkMusetalkConnection);
 
     async function startRecording() {
       try {

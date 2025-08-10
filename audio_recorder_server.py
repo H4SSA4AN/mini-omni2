@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template, send_from_directory, abort
 from flask_cors import CORS
+import requests
 
 try:
     from pydub import AudioSegment
@@ -139,6 +140,55 @@ def _run_a1a2_inference(user_wav: Path) -> dict:
         "answer_path": str(final_answer),
         "answer_url": "/answers/Answer.wav",
     }
+
+
+@app.route("/check_musetalk", methods=["POST"])
+def check_musetalk():
+    try:
+        data = request.get_json(silent=True) or {}
+        base_url = (data.get("url") or "").strip()
+        if not base_url:
+            return jsonify({"ok": False, "error": "missing url"}), 400
+
+        # Candidates to try: exact URL, URL + '/health', URL root
+        candidates = []
+        def add(url: str):
+            if url and url not in [c["url"] for c in candidates]:
+                candidates.append({"url": url})
+        add(base_url)
+        if not base_url.rstrip("/").endswith("health"):
+            add(base_url.rstrip("/") + "/health")
+        # try root if a path exists
+        if "/" in base_url.rstrip("/")[8:]:  # after scheme
+            root = base_url.split("//", 1)[-1]
+            root = root.split("/", 1)[0]
+            scheme = "http" if base_url.lower().startswith("http://") else "https" if base_url.lower().startswith("https://") else "http"
+            add(f"{scheme}://{root}")
+
+        timeout = float(data.get("timeout", 2.5))
+        tried = []
+        for c in candidates:
+            url = c["url"]
+            try:
+                resp = requests.get(url, timeout=timeout)
+                tried.append({"url": url, "status": resp.status_code})
+                if resp.ok:
+                    return jsonify({
+                        "ok": True,
+                        "url": url,
+                        "status": resp.status_code,
+                        "elapsed_ms": int(resp.elapsed.total_seconds() * 1000),
+                        "tried": tried,
+                    }), 200
+            except Exception as e:
+                tried.append({"url": url, "status": None, "error": str(e)})
+
+        return jsonify({
+            "ok": False,
+            "tried": tried,
+        }), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/upload_audio", methods=["POST"])
