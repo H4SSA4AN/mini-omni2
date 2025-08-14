@@ -62,7 +62,7 @@
         <!-- Recording Mode Toggle -->
         <div style="margin: 16px 0; padding: 12px; background: #f8f9fa; border-radius: 6px; border: 1px solid #e9ecef;">
           <div style="margin-bottom: 8px; font-weight: bold; color: #495057;">Recording Mode:</div>
-          <div style="display: flex; gap: 12px; align-items: center;">
+          <div style="display: flex; flex-direction: column; gap: 8px;">
             <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
               <input type="radio" name="recordingMode" value="omni" checked>
               <span>Omni Inference (AI generates response)</span>
@@ -71,7 +71,20 @@
               <input type="radio" name="recordingMode" value="raw">
               <span>Record Self (Raw audio to MuseTalk)</span>
             </label>
+            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+              <input type="radio" name="recordingMode" value="upload">
+              <span>Upload Audio File (Skip inference)</span>
+            </label>
           </div>
+        </div>
+
+        <!-- File Upload Section (hidden by default) -->
+        <div id="fileUploadSection" style="display: none; margin: 16px 0; padding: 12px; background: #e8f4fd; border-radius: 6px; border: 1px solid #bee5eb;">
+          <div style="margin-bottom: 8px; font-weight: bold; color: #0c5460;">Upload Audio File:</div>
+          <input type="file" id="audioFileInput" accept="audio/*" style="margin-bottom: 8px; width: 100%;">
+          <button id="uploadFileBtn" style="background: #17a2b8; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;">
+            Upload & Send to MuseTalk
+          </button>
         </div>
 
         <!-- FPS and Batch Size inputs -->
@@ -595,13 +608,24 @@
       const recordingMode = document.querySelector('input[name="recordingMode"]:checked').value;
       const descriptionEl = document.getElementById('recordingDescription');
       const startBtn = document.getElementById('startBtn');
+      const fileUploadSection = document.getElementById('fileUploadSection');
+      const controlsSection = document.querySelector('.controls');
       
       if (recordingMode === 'raw') {
         descriptionEl.textContent = 'Record your raw audio and send it directly to MuseTalk (no AI inference).';
         startBtn.textContent = 'Start Recording (Raw)';
+        fileUploadSection.style.display = 'none';
+        controlsSection.style.display = 'flex';
+      } else if (recordingMode === 'upload') {
+        descriptionEl.textContent = 'Upload an audio file and send it directly to MuseTalk (no AI inference).';
+        startBtn.textContent = 'Start Recording';
+        fileUploadSection.style.display = 'block';
+        controlsSection.style.display = 'none';
       } else {
         descriptionEl.textContent = 'Record your audio and it will be processed through Omni inference, then sent to MuseTalk.';
         startBtn.textContent = 'Start Recording';
+        fileUploadSection.style.display = 'none';
+        controlsSection.style.display = 'flex';
       }
     }
 
@@ -612,6 +636,93 @@
 
     // Initialize UI
     updateRecordingModeUI();
+
+    // File upload handling
+    const uploadFileBtn = document.getElementById('uploadFileBtn');
+    const audioFileInput = document.getElementById('audioFileInput');
+
+    async function uploadAudioFile() {
+      const file = audioFileInput.files[0];
+      if (!file) {
+        log('Please select an audio file first.');
+        return;
+      }
+
+      const musetalkUrl = musetalkUrlInput.value.trim();
+      if (!musetalkUrl) {
+        log('Please enter a MuseTalk URL first.');
+        return;
+      }
+
+      // If a stream is in progress, abort it.
+      if (streamController) {
+        streamController.abort();
+      }
+
+      // Reset the MuseTalk server state before starting a new session
+      const rawUrl = musetalkUrlInput.value;
+      if (rawUrl) {
+        const baseUrl = normalizeUrl(rawUrl).replace('/stream', '').replace('/health', '');
+        try {
+          log('Resetting MuseTalk server state...');
+          await fetch(`${baseUrl}/reset`, { method: 'POST' });
+        } catch (e) {
+          log(`Could not reset MuseTalk server: ${e.message}`);
+        }
+      }
+
+      // Reset UI elements for the new upload session
+      clearLog();
+      setMusetalkStatusOk('Processing audio file...');
+      musetalkCanvas.style.display = 'none';
+      musetalkPlaceholderEl.style.display = 'flex';
+      connecting = false;
+      t1_stopClickTime = 0;
+      answerUrl = '';
+      playAnswerBtn.disabled = true;
+      answerPlayer.src = '';
+
+      log('Audio file upload started...');
+      t1_stopClickTime = performance.now(); // T1: User clicks upload
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('musetalkUrl', musetalkUrl);
+      formData.append('fps', document.getElementById('fpsInput').value);
+      formData.append('batch_size', document.getElementById('batchInput').value);
+
+      try {
+        const resp = await fetch('/upload_audio_file', { method: 'POST', body: formData });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+
+        log('Audio file uploaded successfully.');
+        if (data.uploaded_audio && data.uploaded_audio.file_url) {
+          answerUrl = data.uploaded_audio.file_url;
+          await new Promise((resolve) => {
+            const onReady = () => { answerPlayer.removeEventListener('canplaythrough', onReady); resolve(); };
+            answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
+            answerPlayer.src = answerUrl + `?t=${Date.now()}`;
+          });
+          const t2_serverResponseTime = performance.now();
+          log(`File upload processing time (T2-T1): ${Math.round(t2_serverResponseTime - t1_stopClickTime)} ms`);
+          
+          if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
+            log('Audio file sent to MuseTalk. Polling for stream...');
+            pollForStreamReady(musetalkUrl);
+          } else {
+            const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
+            setMusetalkStatusErr(`MuseTalk trigger failed: ${errorMsg}`);
+          }
+          playAnswerBtn.disabled = false;
+        }
+      } catch (err) {
+        log(`Error uploading audio file: ${err.message}`);
+        setMusetalkStatusErr(`Upload failed: ${err.message}`);
+      }
+    }
+
+    uploadFileBtn.addEventListener('click', uploadAudioFile);
 
     startBtn.addEventListener('click', startRecording);
     stopBtn.addEventListener('click', stopRecording);
