@@ -335,6 +335,88 @@ def upload_audio():
     }), 200
 
 
+@app.route("/upload_raw_audio", methods=["POST"])
+def upload_raw_audio():
+    """Upload raw audio and send directly to musetalk without omni inference"""
+    if "file" not in request.files:
+        return jsonify({"error": "No file part in the request"}), 400
+    audio_file = request.files["file"]
+    if audio_file.filename == "":
+        return jsonify({"error": "No selected file"}), 400
+
+    mime_type = request.form.get("mimeType", "")
+    duration = request.form.get("duration", "")
+    musetalk_url = request.form.get("musetalkUrl", "").strip()
+    try:
+        fps = int(request.form.get("fps", 25))
+        batch_size = int(request.form.get("batch_size", 8))
+    except (ValueError, TypeError):
+        fps = 25
+        batch_size = 8
+
+    if not musetalk_url:
+        return jsonify({"error": "MuseTalk URL is required for raw audio recording"}), 400
+
+    _clear_dir(ANSWERS_DIR)
+    wav_path = ANSWERS_DIR / "Answer.wav"
+
+    is_wav_upload = (mime_type.lower() == "audio/wav") or audio_file.filename.lower().endswith(".wav")
+    if is_wav_upload:
+        audio_file.save(wav_path)
+    else:
+        if not PYDUB_AVAILABLE:
+            return jsonify({
+                "error": "Conversion to WAV requires pydub. Please install pydub and ffmpeg.",
+                "hint": "pip install pydub and ensure ffmpeg is in PATH"
+            }), 500
+        temp_ext = audio_file.filename.split(".")[-1].lower() if "." in audio_file.filename else "webm"
+        temp_input = ANSWERS_DIR / f"temp_input.{temp_ext}"
+        audio_file.save(temp_input)
+        try:
+            seg = AudioSegment.from_file(temp_input)
+            seg = seg.set_channels(1).set_frame_rate(24000)
+            seg.export(wav_path, format="wav")
+        except Exception as e:
+            return jsonify({
+                "error": f"Failed to convert to WAV: {e}",
+                "hint": "Ensure ffmpeg is installed and available in PATH"
+            }), 500
+        finally:
+            try:
+                temp_input.unlink(missing_ok=True)
+            except TypeError:
+                if temp_input.exists():
+                    temp_input.unlink()
+
+    file_size = wav_path.stat().st_size if wav_path.exists() else 0
+
+    # Forward the raw audio directly to MuseTalk server
+    forward_info = None
+    try:
+        forward_info = _forward_answer_and_trigger_inference(
+            wav_path, 
+            musetalk_url,
+            fps,
+            batch_size
+        )
+    except Exception as e:
+        forward_info = {"ok": False, "error": str(e)}
+
+    return jsonify({
+        "status": "saved",
+        "raw_audio": {
+            "filename": "Answer.wav",
+            "file_path": str(wav_path),
+            "file_url": "/answers/Answer.wav",
+            "mime_type": "audio/wav",
+            "duration": duration,
+            "size_bytes": file_size,
+        },
+        "forwarded_to_musetalk": forward_info,
+        "note": "Raw audio sent directly to MuseTalk (no omni inference)"
+    }), 200
+
+
 @app.route("/recordings/<path:filename>")
 def serve_recording(filename: str):
     target = RECORDINGS_DIR / filename

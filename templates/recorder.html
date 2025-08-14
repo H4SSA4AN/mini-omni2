@@ -49,7 +49,7 @@
       <!-- Left Panel: Main controls/content -->
       <div class="panel" id="leftPanel">
         <h1>Audio Recorder</h1>
-        <p>Record your audio and it will be saved to the server when you press Stop.</p>
+        <p id="recordingDescription">Record your audio and it will be processed through Omni inference, then sent to MuseTalk.</p>
 
         <div id="health" class="status">Checking server...</div>
 
@@ -57,6 +57,21 @@
           <button id="startBtn">Start Recording</button>
           <button id="stopBtn" disabled>Stop</button>
           <button id="playAnswerBtn" disabled>Play Answer</button>
+        </div>
+        
+        <!-- Recording Mode Toggle -->
+        <div style="margin: 16px 0; padding: 12px; background: #f8f9fa; border-radius: 6px; border: 1px solid #e9ecef;">
+          <div style="margin-bottom: 8px; font-weight: bold; color: #495057;">Recording Mode:</div>
+          <div style="display: flex; gap: 12px; align-items: center;">
+            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+              <input type="radio" name="recordingMode" value="omni" checked>
+              <span>Omni Inference (AI generates response)</span>
+            </label>
+            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+              <input type="radio" name="recordingMode" value="raw">
+              <span>Record Self (Raw audio to MuseTalk)</span>
+            </label>
+          </div>
         </div>
 
         <!-- FPS and Batch Size inputs -->
@@ -478,42 +493,70 @@
           formData.append('file', blob, uploadName);
           formData.append('mimeType', blob.type);
           formData.append('duration', ((Date.now() - startTime) / 1000).toFixed(2));
-          // Pass musetalk url and inference params to the new endpoint
           formData.append('musetalkUrl', musetalkUrlInput.value || '');
           formData.append('fps', document.getElementById('fpsInput').value);
           formData.append('batch_size', document.getElementById('batchInput').value);
 
+          // Check recording mode
+          const recordingMode = document.querySelector('input[name="recordingMode"]:checked').value;
+          const endpoint = recordingMode === 'raw' ? '/upload_raw_audio' : '/upload_audio';
+
           try {
-            const resp = await fetch('/upload_audio', { method: 'POST', body: formData });
+            const resp = await fetch(endpoint, { method: 'POST', body: formData });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = await resp.json();
 
-            const inferenceMs = data.metrics && typeof data.metrics.inference_ms === 'number' ? data.metrics.inference_ms : null;
-
-            if (data.answer && data.answer.answer_url) {
-              answerUrl = data.answer.answer_url;
-              await new Promise((resolve) => {
-                const onReady = () => { answerPlayer.removeEventListener('canplaythrough', onReady); resolve(); };
-                answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
-                answerPlayer.src = answerUrl + `?t=${Date.now()}`;
-              });
-              const t2_serverResponseTime = performance.now(); // T2: Server response received
-              log(`Server processing time (T2-T1): ${Math.round(t2_serverResponseTime - t1_stopClickTime)} ms`);
-              
-              // If forwarding was successful, start polling for stream readiness
-              if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
-                log('Audio processing complete. Polling for MuseTalk stream...');
-                pollForStreamReady(musetalkUrlInput.value);
-              } else {
-                const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
-                setMusetalkStatusErr(`MuseTalk trigger failed: ${errorMsg}`);
+            if (recordingMode === 'raw') {
+              // Raw audio mode - no inference, just forward to musetalk
+              log('Raw audio mode: Sending directly to MuseTalk...');
+              if (data.raw_audio && data.raw_audio.file_url) {
+                answerUrl = data.raw_audio.file_url;
+                await new Promise((resolve) => {
+                  const onReady = () => { answerPlayer.removeEventListener('canplaythrough', onReady); resolve(); };
+                  answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
+                  answerPlayer.src = answerUrl + `?t=${Date.now()}`;
+                });
+                const t2_serverResponseTime = performance.now();
+                log(`Raw audio processing time (T2-T1): ${Math.round(t2_serverResponseTime - t1_stopClickTime)} ms`);
+                
+                if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
+                  log('Raw audio sent to MuseTalk. Polling for stream...');
+                  pollForStreamReady(musetalkUrlInput.value);
+                } else {
+                  const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
+                  setMusetalkStatusErr(`MuseTalk trigger failed: ${errorMsg}`);
+                }
+                playAnswerBtn.disabled = false;
               }
-              playAnswerBtn.disabled = false;
             } else {
-              if (typeof inferenceMs === 'number') log(`inference_time_ms: ${inferenceMs}`);
-              log('total_delay_ms: N/A');
+              // Omni inference mode - original behavior
+              const inferenceMs = data.metrics && typeof data.metrics.inference_ms === 'number' ? data.metrics.inference_ms : null;
+
+              if (data.answer && data.answer.answer_url) {
+                answerUrl = data.answer.answer_url;
+                await new Promise((resolve) => {
+                  const onReady = () => { answerPlayer.removeEventListener('canplaythrough', onReady); resolve(); };
+                  answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
+                  answerPlayer.src = answerUrl + `?t=${Date.now()}`;
+                });
+                const t2_serverResponseTime = performance.now();
+                log(`Server processing time (T2-T1): ${Math.round(t2_serverResponseTime - t1_stopClickTime)} ms`);
+                
+                if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
+                  log('Audio processing complete. Polling for MuseTalk stream...');
+                  pollForStreamReady(musetalkUrlInput.value);
+                } else {
+                  const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
+                  setMusetalkStatusErr(`MuseTalk trigger failed: ${errorMsg}`);
+                }
+                playAnswerBtn.disabled = false;
+              } else {
+                if (typeof inferenceMs === 'number') log(`inference_time_ms: ${inferenceMs}`);
+                log('total_delay_ms: N/A');
+              }
             }
           } catch (err) {
+            log(`Error in ${recordingMode} mode: ${err.message}`);
             log('inference_time_ms: N/A');
             log('total_delay_ms: N/A');
           }
@@ -546,6 +589,29 @@
       }
       answerPlayer.play().catch(() => {});
     }
+
+    // Update UI based on recording mode
+    function updateRecordingModeUI() {
+      const recordingMode = document.querySelector('input[name="recordingMode"]:checked').value;
+      const descriptionEl = document.getElementById('recordingDescription');
+      const startBtn = document.getElementById('startBtn');
+      
+      if (recordingMode === 'raw') {
+        descriptionEl.textContent = 'Record your raw audio and send it directly to MuseTalk (no AI inference).';
+        startBtn.textContent = 'Start Recording (Raw)';
+      } else {
+        descriptionEl.textContent = 'Record your audio and it will be processed through Omni inference, then sent to MuseTalk.';
+        startBtn.textContent = 'Start Recording';
+      }
+    }
+
+    // Add event listeners for mode changes
+    document.querySelectorAll('input[name="recordingMode"]').forEach(radio => {
+      radio.addEventListener('change', updateRecordingModeUI);
+    });
+
+    // Initialize UI
+    updateRecordingModeUI();
 
     startBtn.addEventListener('click', startRecording);
     stopBtn.addEventListener('click', stopRecording);
