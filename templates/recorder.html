@@ -194,7 +194,7 @@
       musetalkStatusEl.className = 'status';
       musetalkStatusEl.textContent = 'Checking...';
       try {
-        const resp = await fetch('/check_musetalk', {
+        const resp = await fetch('/proxy/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url })
@@ -202,10 +202,11 @@
         const data = await resp.json();
         if (data.ok) {
           const ms = typeof data.elapsed_ms === 'number' ? `${data.elapsed_ms} ms` : 'N/A';
-          setMusetalkStatusOk(`Connected: ${data.url || url} [${data.status}] in ${ms}`);
+          const message = data.message || 'Health check successful';
+          setMusetalkStatusOk(`✅ ${message} - ${data.url} [${data.status}] in ${ms}`);
         } else {
-          const detail = data.tried && data.tried.length ? ` Tried: ${data.tried.map(t => t.url + (t.status ? `(${t.status})` : '')).join(', ')}` : '';
-          setMusetalkStatusErr('Connection failed.' + detail);
+          const message = data.message || data.error || 'unknown error';
+          setMusetalkStatusErr(`❌ ${message}`);
         }
       } catch (e) {
         setMusetalkStatusErr('Connection check error');
@@ -274,7 +275,9 @@
         streamController = new AbortController();
         const signal = streamController.signal;
 
-        const response = await fetch(streamUrl, { signal });
+        // Use proxy for streaming
+        const proxyUrl = `/api/stream?target_url=${encodeURIComponent(streamUrl)}`;
+        const response = await fetch(proxyUrl, { signal });
         if (!response.ok) {
           throw new Error(`Connection failed: ${response.status} ${response.statusText}`);
         }
@@ -419,7 +422,8 @@
         if (streamConnected) return; // Stop polling once connected
 
         try {
-          const response = await fetch(statusUrl);
+          const proxyStatusUrl = `/api/stream_status?target_url=${encodeURIComponent(baseUrl)}`;
+          const response = await fetch(proxyStatusUrl);
           const data = await response.json();
 
           // Continuously update T4 when available
@@ -461,8 +465,11 @@
     });
 
     async function startRecording() {
+      log('Start Recording button clicked');
+      
       // If a stream is in progress, abort it.
       if (streamController) {
+          log('Aborting existing stream...');
           streamController.abort();
       }
 
@@ -472,7 +479,8 @@
           const baseUrl = normalizeUrl(rawUrl).replace('/stream', '').replace('/health', '');
           try {
               log('Resetting MuseTalk server state...');
-              await fetch(`${baseUrl}/reset`, { method: 'POST' });
+              const proxyResetUrl = `/api/reset?target_url=${encodeURIComponent(baseUrl)}`;
+              await fetch(proxyResetUrl, { method: 'POST' });
           } catch (e) {
               log(`Could not reset MuseTalk server: ${e.message}`);
           }
@@ -490,9 +498,14 @@
       answerPlayer.src = '';
 
       try {
+        log('Requesting microphone access...');
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        log('Microphone access granted');
+        
         chunks = [];
         mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+        log('MediaRecorder created');
+        
         mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
         mediaRecorder.onstop = async () => {
           const blob = new Blob(chunks, { type: 'audio/webm' });
@@ -574,15 +587,19 @@
             log('total_delay_ms: N/A');
           }
         };
+        log('Starting recording...');
         mediaRecorder.start(250);
         startTime = Date.now();
         startBtn.disabled = true;
         stopBtn.disabled = false;
         playAnswerBtn.disabled = true;
+        log('Recording started successfully');
       } catch (err) {
         clearLog();
+        log(`Error starting recording: ${err.message}`);
         log('inference_time_ms: N/A');
         log('total_delay_ms: N/A');
+        console.error('Recording error:', err);
       }
     }
 
@@ -665,7 +682,8 @@
         const baseUrl = normalizeUrl(rawUrl).replace('/stream', '').replace('/health', '');
         try {
           log('Resetting MuseTalk server state...');
-          await fetch(`${baseUrl}/reset`, { method: 'POST' });
+          const proxyResetUrl = `/api/reset?target_url=${encodeURIComponent(baseUrl)}`;
+          await fetch(proxyResetUrl, { method: 'POST' });
         } catch (e) {
           log(`Could not reset MuseTalk server: ${e.message}`);
         }

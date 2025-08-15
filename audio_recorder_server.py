@@ -16,6 +16,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, render_template, send_from_directory, abort
 from flask_cors import CORS
 import requests
+from proxy import create_proxy_routes
 
 try:
     from pydub import AudioSegment
@@ -36,6 +37,9 @@ import shutil
 # Initialize Flask app
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app)
+
+# Add proxy routes
+proxy_instance = create_proxy_routes(app)
 
 BASE_DIR = Path(__file__).parent
 RECORDINGS_DIR = BASE_DIR / "recordings"
@@ -114,17 +118,26 @@ def _forward_answer_and_trigger_inference(answer_path: Path, musetalk_url: str, 
     2. POST to MuseTalk server's /start to trigger inference with custom params.
     """
     try:
-        # Step 1: Upload the audio file
-        upload_url = _normalize_musetalk_upload_url(musetalk_url)
+        # Normalize the base URL (remove any paths like /stream, /health, etc.)
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(musetalk_url)
+        base_url = urlunparse((parsed.scheme or 'http', parsed.netloc, '', '', '', ''))
+        print(f"Original musetalk_url: {musetalk_url}")
+        print(f"Normalized base_url: {base_url}")
+        
+        # Step 1: Upload the audio file directly to MuseTalk
+        upload_url = f"{base_url}/upload_answer"
         files = {'file': ('Answer.wav', open(answer_path, 'rb'), 'audio/wav')}
+        print(f"Upload URL: {upload_url}")
         upload_resp = requests.post(upload_url, files=files, timeout=10)
         
         if not upload_resp.ok:
             return {"ok": False, "step": "upload", "status": upload_resp.status_code, "text": upload_resp.text}
         
-        # Step 2: Trigger inference with parameters
-        start_url = _normalize_musetalk_start_url(musetalk_url)
+        # Step 2: Trigger inference with parameters directly to MuseTalk
+        start_url = f"{base_url}/start"
         payload = {"fps": fps, "batch_size": batch_size}
+        print(f"Start URL: {start_url}")
         start_resp = requests.post(start_url, json=payload, timeout=10)
 
         if not start_resp.ok:
@@ -196,49 +209,23 @@ def _run_a1a2_inference(user_wav: Path) -> dict:
 
 @app.route("/check_musetalk", methods=["POST"])
 def check_musetalk():
+    """This endpoint is now deprecated - use /proxy/check instead"""
     try:
         data = request.get_json(silent=True) or {}
         base_url = (data.get("url") or "").strip()
         if not base_url:
             return jsonify({"ok": False, "error": "missing url"}), 400
 
-        # Candidates to try: exact URL, URL + '/health', URL root
-        candidates = []
-        def add(url: str):
-            if url and url not in [c["url"] for c in candidates]:
-                candidates.append({"url": url})
-        add(base_url)
-        if not base_url.rstrip("/").endswith("health"):
-            add(base_url.rstrip("/") + "/health")
-        # try root if a path exists
-        if "/" in base_url.rstrip("/")[8:]:  # after scheme
-            root = base_url.split("//", 1)[-1]
-            root = root.split("/", 1)[0]
-            scheme = "http" if base_url.lower().startswith("http://") else "https" if base_url.lower().startswith("https://") else "http"
-            add(f"{scheme}://{root}")
-
-        timeout = float(data.get("timeout", 2.5))
-        tried = []
-        for c in candidates:
-            url = c["url"]
-            try:
-                resp = requests.get(url, timeout=timeout)
-                tried.append({"url": url, "status": resp.status_code})
-                if resp.ok:
-                    return jsonify({
-                        "ok": True,
-                        "url": url,
-                        "status": resp.status_code,
-                        "elapsed_ms": int(resp.elapsed.total_seconds() * 1000),
-                        "tried": tried,
-                    }), 200
-            except Exception as e:
-                tried.append({"url": url, "status": None, "error": str(e)})
-
-        return jsonify({
-            "ok": False,
-            "tried": tried,
-        }), 200
+        # Use the proxy to check the connection
+        proxy_url = "/proxy/check"
+        proxy_data = {"url": base_url}
+        resp = requests.post(proxy_url, json=proxy_data, timeout=10)
+        
+        if resp.ok:
+            return resp.json(), 200
+        else:
+            return jsonify({"ok": False, "error": "Proxy check failed"}), 500
+            
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
