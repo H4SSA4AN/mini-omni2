@@ -317,12 +317,16 @@
             return -1;
         }
 
-        // Buffered playback render loop
+        // Buffered playback render loop with precise timing
         function renderLoop(timestamp) {
             if (!lastFrameTime) lastFrameTime = timestamp;
-            let elapsed = timestamp - lastFrameTime;
-
-            if (elapsed > frameDuration && playbackQueue.length > 0) {
+            
+            // Calculate expected next frame time to prevent timing drift
+            const expectedFrameTime = lastFrameTime + frameDuration;
+            const elapsed = timestamp - expectedFrameTime;
+            
+            // If we're behind schedule or have frames to play
+            if (elapsed >= 0 && playbackQueue.length > 0) {
                 const frameData = playbackQueue.shift();
                 const blob = new Blob([frameData], { type: 'image/jpeg' });
                 const imageUrl = URL.createObjectURL(blob);
@@ -349,7 +353,7 @@
                     
                     // Update status every 10 frames
                     if (totalFramesPlayed % 10 === 0) {
-                        const totalElapsed = timestamp - playbackStartTime;
+                        const totalElapsed = performance.now() - playbackStartTime;
                         const actualFps = totalElapsed > 0 ? (totalFramesPlayed / (totalElapsed / 1000)).toFixed(1) : '0.0';
                         setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length} | FPS: ${actualFps}/${fps}`);
                         log(`🎯 Playback: ${totalFramesPlayed} frames played, ${playbackQueue.length} in buffer, FPS: ${actualFps}/${fps}`);
@@ -362,7 +366,14 @@
                 };
                 
                 img.src = imageUrl;
-                lastFrameTime = timestamp;
+                
+                // KEY FIX: Update timing for next frame using expected time, not current time
+                lastFrameTime = expectedFrameTime;
+                
+                // Log if we're falling behind schedule
+                if (elapsed > frameDuration) {
+                    log(`⚠️ Behind schedule by ${elapsed.toFixed(1)}ms, attempting to catch up`);
+                }
             }
             
             // Continue rendering loop
