@@ -259,7 +259,7 @@
       }
       connecting = true;
       setMusetalkStatusOk('Connecting to stream...');
-      log(`Connecting to stream for manual rendering at ${fps} FPS`);
+      log(`Connecting to stream for buffered playback at ${fps} FPS`);
 
       const canvas = musetalkCanvas;
       const ctx = canvas.getContext('2d');
@@ -282,14 +282,25 @@
           throw new Error(`Connection failed: ${response.status} ${response.statusText}`);
         }
         
-        log('Stream connected. Parsing frames...');
-        setMusetalkStatusOk('Connected. Parsing frames...');
+        log('Stream connected. Buffering frames...');
+        setMusetalkStatusOk('Connected. Buffering frames...');
 
         const reader = response.body.getReader();
         let buffer = new Uint8Array();
         const SOI = new Uint8Array([0xFF, 0xD8]); // Start of Image
         const EOI = new Uint8Array([0xFF, 0xD9]); // End of Image
         let frameCount = 0;
+        let playbackStarted = false;
+        let audioStarted = false;
+
+        // Buffered playback system
+        let frameQueue = [];
+        let playbackQueue = [];
+        let lastFrameTime = 0;
+        const frameDuration = 1000 / fps;
+        const initialBufferSize = Math.max(10, Math.ceil(fps / 2)); // Buffer 0.5 seconds worth of frames
+        let totalFramesReceived = 0;
+        let totalFramesPlayed = 0;
 
         function findMarker(data, marker) {
             for (let i = 0; i < data.length - marker.length + 1; i++) {
@@ -305,17 +316,13 @@
             return -1;
         }
 
-        // We use requestAnimationFrame for smoother, more efficient rendering
-        let lastFrameTime = 0;
-        const frameDuration = 1000 / fps;
-        let frameQueue = [];
-
+        // Buffered playback render loop
         function renderLoop(timestamp) {
             if (!lastFrameTime) lastFrameTime = timestamp;
             let elapsed = timestamp - lastFrameTime;
 
-            if (elapsed > frameDuration && frameQueue.length > 0) {
-                const frameData = frameQueue.shift();
+            if (elapsed > frameDuration && playbackQueue.length > 0) {
+                const frameData = playbackQueue.shift();
                 const blob = new Blob([frameData], { type: 'image/jpeg' });
                 const imageUrl = URL.createObjectURL(blob);
                 const img = new Image();
@@ -324,49 +331,56 @@
                     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
                     URL.revokeObjectURL(imageUrl); // Clean up memory
 
-                    if (frameCount === 0) {
-                        const t3_firstFrameTime = performance.now(); // T3: First frame displayed
+                    if (totalFramesPlayed === 0) {
+                        const t3_firstFrameTime = performance.now();
                         if (t1_stopClickTime > 0) {
                             log(`>>> Total time to first frame (T3-T1): ${Math.round(t3_firstFrameTime - t1_stopClickTime)} ms`);
                         }
-                        log('First frame rendered, playing audio...');
-                        playAnswer();
+                        log(`Playback started with ${playbackQueue.length} frames buffered`);
+                        if (!audioStarted) {
+                            audioStarted = true;
+                            playAnswer();
+                        }
                     }
 
-                    frameCount++;
-                    // Only update status, no per-frame log
-                    setMusetalkStatusOk(`Displayed frame: ${frameCount}`);
+                    totalFramesPlayed++;
+                    
+                    // Update status every 10 frames
+                    if (totalFramesPlayed % 10 === 0) {
+                        const actualFps = (totalFramesPlayed / (elapsed / 1000)).toFixed(1);
+                        setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length} | FPS: ${actualFps}/${fps}`);
+                    }
                 };
+                
                 img.onerror = () => {
-                    log(`Error loading image for frame ${frameCount + 1}`);
+                    log(`Error loading image for frame ${totalFramesPlayed + 1}`);
                     URL.revokeObjectURL(imageUrl);
                 };
+                
                 img.src = imageUrl;
                 lastFrameTime = timestamp;
             }
+            
+            // Continue rendering loop
             requestAnimationFrame(renderLoop);
         }
-        
+
+        // Start the render loop immediately
         requestAnimationFrame(renderLoop);
 
+        // Frame processing and buffering
         async function processFrames() {
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) {
-                    const t5_streamEndTime = performance.now(); // T5: Stream display ends
+                    const t5_streamEndTime = performance.now();
                     if (t4_inferenceEndTime > 0) {
-                        // Server time is in seconds, client is in ms. Convert T4 to ms.
-                        const t4_ms = t4_inferenceEndTime * 1000;
-                        // We need a common reference. Let's use the time since T1.
-                        const t5_relative = t5_streamEndTime - t1_stopClickTime;
-                        const t4_relative = t4_ms - (performance.timeOrigin + t1_stopClickTime);
-                        // This calculation is complex due to different clocks. Let's log what we have.
                         log(`Stream display finished.`);
                         log(`>>> Stream drain time (T5-T4): (See poll logs for T4)`);
                     } else {
                         log('Stream finished.');
                     }
-                    setMusetalkStatusOk(`Stream ended. Total frames displayed: ${frameCount}`);
+                    setMusetalkStatusOk(`Stream ended. Total frames: ${totalFramesReceived}, Played: ${totalFramesPlayed}`);
                     break;
                 }
 
@@ -386,12 +400,33 @@
 
                     const frameData = buffer.subarray(soiIndex, soiIndex + eoiIndex + EOI.length);
                     frameQueue.push(frameData);
+                    totalFramesReceived++;
 
                     // Remove processed frame from buffer
                     buffer = buffer.subarray(soiIndex + eoiIndex + EOI.length);
                 }
+
+                // Buffering logic: Start playback when we have enough frames
+                if (!playbackStarted && frameQueue.length >= initialBufferSize) {
+                    playbackStarted = true;
+                    log(`Initial buffer complete (${frameQueue.length} frames). Starting playback...`);
+                    setMusetalkStatusOk(`Buffer ready. Starting playback at ${fps} FPS...`);
+                    
+                    // Move all buffered frames to playback queue
+                    playbackQueue = [...frameQueue];
+                    frameQueue = [];
+                } else if (playbackStarted) {
+                    // After playback starts, continuously add new frames to playback queue
+                    while (frameQueue.length > 0) {
+                        playbackQueue.push(frameQueue.shift());
+                    }
+                } else {
+                    // Still buffering
+                    setMusetalkStatusOk(`Buffering: ${frameQueue.length}/${initialBufferSize} frames...`);
+                }
             }
         }
+        
         await processFrames();
 
       } catch (e) {
