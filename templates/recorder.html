@@ -297,6 +297,7 @@
         let frameQueue = [];
         let playbackQueue = [];
         let lastFrameTime = 0;
+        let playbackStartTime = 0;
         const frameDuration = 1000 / fps;
         const initialBufferSize = Math.max(10, Math.ceil(fps / 2)); // Buffer 0.5 seconds worth of frames
         let totalFramesReceived = 0;
@@ -333,6 +334,7 @@
 
                     if (totalFramesPlayed === 0) {
                         const t3_firstFrameTime = performance.now();
+                        playbackStartTime = t3_firstFrameTime;
                         if (t1_stopClickTime > 0) {
                             log(`>>> Total time to first frame (T3-T1): ${Math.round(t3_firstFrameTime - t1_stopClickTime)} ms`);
                         }
@@ -347,7 +349,8 @@
                     
                     // Update status every 10 frames
                     if (totalFramesPlayed % 10 === 0) {
-                        const actualFps = (totalFramesPlayed / (elapsed / 1000)).toFixed(1);
+                        const totalElapsed = timestamp - playbackStartTime;
+                        const actualFps = totalElapsed > 0 ? (totalFramesPlayed / (totalElapsed / 1000)).toFixed(1) : '0.0';
                         setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length} | FPS: ${actualFps}/${fps}`);
                     }
                 };
