@@ -368,8 +368,7 @@
                     if (totalFramesPlayed % 10 === 0) {
                         const totalElapsed = performance.now() - playbackStartTime;
                         const actualFps = totalElapsed > 0 ? (totalFramesPlayed / (totalElapsed / 1000)).toFixed(1) : '0.0';
-                        const bufferPercent = Math.round((playbackQueue.length / maxBufferSize) * 100);
-                        setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length}/${maxBufferSize} (${bufferPercent}%) | FPS: ${actualFps}/${fps}`);
+                        setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length} | FPS: ${actualFps}/${fps}`);
                     }
                 };
                 
