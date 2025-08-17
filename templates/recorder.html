@@ -293,13 +293,14 @@
         let playbackStarted = false;
         let audioStarted = false;
 
-        // Optimized playback system - start immediately when frames arrive
+        // FPS-controlled playback system
         let frameQueue = [];
         let playbackQueue = [];
         let lastFrameTime = 0;
         let playbackStartTime = 0;
         const frameDuration = 1000 / fps;
         const initialBufferSize = 1; // Start immediately with first frame
+        const maxBufferSize = fps * 5; // Maximum 5 seconds of frames in buffer
         let totalFramesReceived = 0;
         let totalFramesPlayed = 0;
         let streamReady = false; // Track when streaming is actually ready
@@ -318,63 +319,64 @@
             return -1;
         }
 
-        // Optimized buffered playback render loop with immediate processing
+        // FPS-controlled playback render loop with catch-up mechanism
         function renderLoop(timestamp) {
             if (!lastFrameTime) lastFrameTime = timestamp;
             
-            // Process all available frames immediately when streaming is ready
-            if (streamReady && playbackQueue.length > 0) {
-                // Process multiple frames to catch up quickly
-                const maxFramesPerLoop = Math.max(1, Math.ceil(playbackQueue.length / 5)); // Process up to 20% of buffer per loop
-                let framesProcessed = 0;
-                
-                while (playbackQueue.length > 0 && framesProcessed < maxFramesPerLoop) {
-                    const frameData = playbackQueue.shift();
-                    const blob = new Blob([frameData], { type: 'image/jpeg' });
-                    const imageUrl = URL.createObjectURL(blob);
-                    const img = new Image();
+            // Calculate time since last frame
+            const elapsed = timestamp - lastFrameTime;
+            
+            // Determine if we should process frames (respecting FPS or catching up)
+            const shouldProcessFrame = streamReady && playbackQueue.length > 0 && elapsed >= frameDuration;
+            const isBehindSchedule = playbackQueue.length > maxBufferSize * 0.8; // If buffer is 80% full, we're behind
+            
+            if (shouldProcessFrame || (isBehindSchedule && streamReady && playbackQueue.length > 0)) {
+                // Process exactly one frame per FPS interval (or catch up if behind)
+                const frameData = playbackQueue.shift();
+                const blob = new Blob([frameData], { type: 'image/jpeg' });
+                const imageUrl = URL.createObjectURL(blob);
+                const img = new Image();
 
-                    img.onload = () => {
-                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                        URL.revokeObjectURL(imageUrl); // Clean up memory
+                img.onload = () => {
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    URL.revokeObjectURL(imageUrl); // Clean up memory
 
-                        if (totalFramesPlayed === 0) {
-                            const t3_firstFrameTime = performance.now();
-                            playbackStartTime = t3_firstFrameTime;
-                            if (t1_stopClickTime > 0) {
-                                log(`>>> Total time to first frame (T3-T1): ${Math.round(t3_firstFrameTime - t1_stopClickTime)} ms`);
-                            }
-                            log(`Playback started with ${playbackQueue.length} frames buffered`);
-                            if (!audioStarted) {
-                                audioStarted = true;
-                                playAnswer();
-                            }
+                    if (totalFramesPlayed === 0) {
+                        const t3_firstFrameTime = performance.now();
+                        playbackStartTime = t3_firstFrameTime;
+                        if (t1_stopClickTime > 0) {
+                            log(`>>> Total time to first frame (T3-T1): ${Math.round(t3_firstFrameTime - t1_stopClickTime)} ms`);
                         }
+                        log(`Playback started with ${playbackQueue.length} frames buffered at ${fps} FPS`);
+                        if (!audioStarted) {
+                            audioStarted = true;
+                            playAnswer();
+                        }
+                    }
 
-                        totalFramesPlayed++;
-                        
-                        // Update status every 10 frames
+                    totalFramesPlayed++;
+                    
+                                            // Update status every 10 frames
                         if (totalFramesPlayed % 10 === 0) {
                             const totalElapsed = performance.now() - playbackStartTime;
                             const actualFps = totalElapsed > 0 ? (totalFramesPlayed / (totalElapsed / 1000)).toFixed(1) : '0.0';
-                            setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length} | FPS: ${actualFps}/${fps}`);
+                            const bufferPercent = Math.round((playbackQueue.length / maxBufferSize) * 100);
+                            setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length}/${maxBufferSize} (${bufferPercent}%) | FPS: ${actualFps}/${fps}`);
                         }
-                    };
-                    
-                    img.onerror = () => {
-                        log(`Error loading image for frame ${totalFramesPlayed + 1}`);
-                        URL.revokeObjectURL(imageUrl);
-                    };
-                    
-                    img.src = imageUrl;
-                    framesProcessed++;
-                }
+                };
                 
-                // Update timing for smooth playback
+                img.onerror = () => {
+                    log(`Error loading image for frame ${totalFramesPlayed + 1}`);
+                    URL.revokeObjectURL(imageUrl);
+                };
+                
+                img.src = imageUrl;
+                
+                // Update timing for next frame
                 lastFrameTime = timestamp;
             }
             
-            // Continue rendering loop immediately for maximum responsiveness
+            // Continue rendering loop
             requestAnimationFrame(renderLoop);
         }
 
@@ -430,10 +432,20 @@
                     playbackQueue = [...frameQueue];
                     frameQueue = [];
                 } else if (playbackStarted && streamReady) {
-                    // After playback starts, immediately process all new frames
-                    // This ensures no delay in processing new batches
+                    // After playback starts, add new frames to playback queue
                     while (frameQueue.length > 0) {
                         playbackQueue.push(frameQueue.shift());
+                    }
+                    
+                    // Buffer management: if buffer gets too full, drop oldest frames to maintain target FPS
+                    if (playbackQueue.length > maxBufferSize) {
+                        const framesToDrop = playbackQueue.length - maxBufferSize;
+                        for (let i = 0; i < framesToDrop; i++) {
+                            playbackQueue.shift(); // Drop oldest frames
+                        }
+                        if (framesToDrop > 0) {
+                            log(`Buffer full, dropped ${framesToDrop} old frames to maintain ${fps} FPS`);
+                        }
                     }
                 } else if (!playbackStarted) {
                     // Waiting for first frame
