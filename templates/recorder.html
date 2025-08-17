@@ -299,7 +299,6 @@
         let lastFrameTime = 0;
         let playbackStartTime = 0;
         const frameDuration = 1000 / fps;
-        const initialBufferSize = 1; // Start immediately with first frame
         let totalFramesReceived = 0;
         let totalFramesPlayed = 0;
         let streamReady = false; // Track when streaming is actually ready
@@ -418,8 +417,8 @@
                     buffer = buffer.subarray(soiIndex + eoiIndex + EOI.length);
                 }
 
-                // Immediate playback logic: Start as soon as first frame arrives
-                if (!playbackStarted && frameQueue.length >= initialBufferSize) {
+                // Immediate playback logic: Start processing frames as soon as they arrive
+                if (!playbackStarted && frameQueue.length > 0) {
                     playbackStarted = true;
                     streamReady = true;
                     log(`Stream started! Processing ${frameQueue.length} frames immediately...`);
