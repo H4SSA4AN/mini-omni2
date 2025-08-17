@@ -356,7 +356,6 @@
                         const totalElapsed = performance.now() - playbackStartTime;
                         const actualFps = totalElapsed > 0 ? (totalFramesPlayed / (totalElapsed / 1000)).toFixed(1) : '0.0';
                         setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length} | FPS: ${actualFps}/${fps}`);
-                        log(`🎯 Playback: ${totalFramesPlayed} frames played, ${playbackQueue.length} in buffer, FPS: ${actualFps}/${fps}`);
                     }
                 };
                 
@@ -369,11 +368,6 @@
                 
                 // KEY FIX: Update timing for next frame using expected time, not current time
                 lastFrameTime = expectedFrameTime;
-                
-                // Log if we're falling behind schedule
-                if (elapsed > frameDuration) {
-                    log(`⚠️ Behind schedule by ${elapsed.toFixed(1)}ms, attempting to catch up`);
-                }
             }
             
             // Continue rendering loop
@@ -416,11 +410,6 @@
                     const frameData = buffer.subarray(soiIndex, soiIndex + eoiIndex + EOI.length);
                     frameQueue.push(frameData);
                     totalFramesReceived++;
-                    
-                    // Log frame reception periodically
-                    if (totalFramesReceived % 10 === 0) {
-                        log(`📡 Received frame ${totalFramesReceived} from server. Frame queue: ${frameQueue.length}, Playback queue: ${playbackQueue.length}`);
-                    }
 
                     // Remove processed frame from buffer
                     buffer = buffer.subarray(soiIndex + eoiIndex + EOI.length);
@@ -429,28 +418,20 @@
                 // Buffering logic: Start playback when we have enough frames
                 if (!playbackStarted && frameQueue.length >= initialBufferSize) {
                     playbackStarted = true;
-                    log(`🎬 Initial buffer complete (${frameQueue.length} frames). Starting playback...`);
+                    log(`Initial buffer complete. Starting playback...`);
                     setMusetalkStatusOk(`Buffer ready. Starting playback at ${fps} FPS...`);
                     
                     // Move all buffered frames to playback queue
                     playbackQueue = [...frameQueue];
-                    log(`📦 Moved ${frameQueue.length} frames to playback queue. Playback queue size: ${playbackQueue.length}`);
                     frameQueue = [];
                 } else if (playbackStarted) {
                     // After playback starts, continuously add new frames to playback queue
-                    const framesAdded = frameQueue.length;
                     while (frameQueue.length > 0) {
                         playbackQueue.push(frameQueue.shift());
-                    }
-                    if (framesAdded > 0) {
-                        log(`📥 Added ${framesAdded} new frames to playback queue. Total buffered: ${playbackQueue.length}`);
                     }
                 } else {
                     // Still buffering
                     setMusetalkStatusOk(`Buffering: ${frameQueue.length}/${initialBufferSize} frames...`);
-                    if (totalFramesReceived % 5 === 0) { // Log every 5 frames during buffering
-                        log(`📋 Buffering progress: ${frameQueue.length}/${initialBufferSize} frames (${totalFramesReceived} total received)`);
-                    }
                 }
             }
         }
