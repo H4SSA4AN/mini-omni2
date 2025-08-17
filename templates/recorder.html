@@ -293,12 +293,12 @@
         let playbackStarted = false;
         let audioStarted = false;
 
-        // FPS-controlled playback system
+        // Precise FPS-controlled playback system
         let frameQueue = [];
         let playbackQueue = [];
         let lastFrameTime = 0;
         let playbackStartTime = 0;
-        const frameDuration = 1000 / fps;
+        const frameDuration = 1000 / fps; // Exact milliseconds between frames
         const initialBufferSize = 1; // Start immediately with first frame
         const maxBufferSize = fps * 5; // Maximum 5 seconds of frames in buffer
         let totalFramesReceived = 0;
@@ -319,19 +319,27 @@
             return -1;
         }
 
-        // FPS-controlled playback render loop with catch-up mechanism
-        function renderLoop(timestamp) {
-            if (!lastFrameTime) lastFrameTime = timestamp;
+                // Precise FPS-controlled playback using setTimeout for exact timing
+        let frameTimer = null;
+        let nextFrameTime = 0;
+        
+        function scheduleNextFrame() {
+            if (!streamReady || playbackQueue.length === 0) {
+                // Continue checking for frames
+                frameTimer = setTimeout(scheduleNextFrame, 16); // ~60fps polling
+                return;
+            }
             
-            // Calculate time since last frame
-            const elapsed = timestamp - lastFrameTime;
+            const now = performance.now();
             
-            // Determine if we should process frames (respecting FPS or catching up)
-            const shouldProcessFrame = streamReady && playbackQueue.length > 0 && elapsed >= frameDuration;
-            const isBehindSchedule = playbackQueue.length > maxBufferSize * 0.8; // If buffer is 80% full, we're behind
+            // If this is the first frame, set the initial timing
+            if (nextFrameTime === 0) {
+                nextFrameTime = now;
+            }
             
-            if (shouldProcessFrame || (isBehindSchedule && streamReady && playbackQueue.length > 0)) {
-                // Process exactly one frame per FPS interval (or catch up if behind)
+            // Check if it's time for the next frame
+            if (now >= nextFrameTime) {
+                // Process the frame
                 const frameData = playbackQueue.shift();
                 const blob = new Blob([frameData], { type: 'image/jpeg' });
                 const imageUrl = URL.createObjectURL(blob);
@@ -356,13 +364,13 @@
 
                     totalFramesPlayed++;
                     
-                                            // Update status every 10 frames
-                        if (totalFramesPlayed % 10 === 0) {
-                            const totalElapsed = performance.now() - playbackStartTime;
-                            const actualFps = totalElapsed > 0 ? (totalFramesPlayed / (totalElapsed / 1000)).toFixed(1) : '0.0';
-                            const bufferPercent = Math.round((playbackQueue.length / maxBufferSize) * 100);
-                            setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length}/${maxBufferSize} (${bufferPercent}%) | FPS: ${actualFps}/${fps}`);
-                        }
+                    // Update status every 10 frames
+                    if (totalFramesPlayed % 10 === 0) {
+                        const totalElapsed = performance.now() - playbackStartTime;
+                        const actualFps = totalElapsed > 0 ? (totalFramesPlayed / (totalElapsed / 1000)).toFixed(1) : '0.0';
+                        const bufferPercent = Math.round((playbackQueue.length / maxBufferSize) * 100);
+                        setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length}/${maxBufferSize} (${bufferPercent}%) | FPS: ${actualFps}/${fps}`);
+                    }
                 };
                 
                 img.onerror = () => {
@@ -372,16 +380,31 @@
                 
                 img.src = imageUrl;
                 
-                // Update timing for next frame
-                lastFrameTime = timestamp;
+                // Schedule next frame at exact FPS interval
+                nextFrameTime += frameDuration;
+                
+                // If we're falling behind, adjust timing to catch up gradually
+                if (playbackQueue.length > maxBufferSize * 0.8) {
+                    // Slightly reduce the interval to catch up
+                    nextFrameTime = Math.max(nextFrameTime, now + frameDuration * 0.8);
+                }
+                
+                // Ensure we don't schedule too far in the future (prevents drift)
+                const maxFutureTime = now + frameDuration * 2;
+                if (nextFrameTime > maxFutureTime) {
+                    nextFrameTime = maxFutureTime;
+                }
             }
             
-            // Continue rendering loop
-            requestAnimationFrame(renderLoop);
+            // Schedule next check
+            const timeUntilNextFrame = Math.max(1, nextFrameTime - performance.now());
+            frameTimer = setTimeout(scheduleNextFrame, timeUntilNextFrame);
         }
+        
+        // Start the precise timing loop
+        scheduleNextFrame();
 
-        // Start the render loop immediately
-        requestAnimationFrame(renderLoop);
+        // Precise timing system is now active
 
         // Frame processing and buffering
         async function processFrames() {
@@ -396,6 +419,12 @@
                         log('Stream finished.');
                     }
                     setMusetalkStatusOk(`Stream ended. Total frames: ${totalFramesReceived}, Played: ${totalFramesPlayed}`);
+                    
+                    // Clean up timer when stream ends
+                    if (frameTimer) {
+                        clearTimeout(frameTimer);
+                        frameTimer = null;
+                    }
                     break;
                 }
 
@@ -456,7 +485,7 @@
         
         await processFrames();
 
-      } catch (e) {
+              } catch (e) {
         if (e.name === 'AbortError') {
             log('Stream connection aborted for new recording.');
         } else {
@@ -466,6 +495,11 @@
             musetalkPlaceholderEl.style.display = 'flex';
         }
       } finally {
+        // Clean up timer
+        if (frameTimer) {
+            clearTimeout(frameTimer);
+            frameTimer = null;
+        }
         connecting = false;
         streamController = null;
       }
