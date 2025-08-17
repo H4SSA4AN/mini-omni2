@@ -317,16 +317,27 @@
             return -1;
         }
 
-                // FPS-controlled buffered playback render loop
-        function renderLoop(timestamp) {
-            if (!lastFrameTime) lastFrameTime = timestamp;
+                // Precise FPS-controlled playback using setTimeout
+        let frameTimer = null;
+        let nextFrameTime = 0;
+        
+        function scheduleNextFrame() {
+            if (!streamReady || playbackQueue.length === 0) {
+                // Continue checking for frames
+                frameTimer = setTimeout(scheduleNextFrame, 16); // ~60fps polling
+                return;
+            }
             
-            // Calculate time since last frame
-            const elapsed = timestamp - lastFrameTime;
+            const now = performance.now();
             
-            // Process frames at target FPS rate when streaming is ready
-            if (streamReady && playbackQueue.length > 0 && elapsed >= frameDuration) {
-                // Process exactly one frame per FPS interval
+            // If this is the first frame, set the initial timing
+            if (nextFrameTime === 0) {
+                nextFrameTime = now;
+            }
+            
+            // Check if it's time for the next frame
+            if (now >= nextFrameTime) {
+                // Process the frame
                 const frameData = playbackQueue.shift();
                 const blob = new Blob([frameData], { type: 'image/jpeg' });
                 const imageUrl = URL.createObjectURL(blob);
@@ -366,16 +377,19 @@
                 
                 img.src = imageUrl;
                 
-                // Update timing for next frame
-                lastFrameTime = timestamp;
+                // Schedule next frame at exact FPS interval
+                nextFrameTime += frameDuration;
             }
             
-            // Continue rendering loop
-            requestAnimationFrame(renderLoop);
+            // Schedule next check
+            const timeUntilNextFrame = Math.max(1, nextFrameTime - performance.now());
+            frameTimer = setTimeout(scheduleNextFrame, timeUntilNextFrame);
         }
         
-        // Start the render loop
-        requestAnimationFrame(renderLoop);
+        // Start the precise timing loop
+        scheduleNextFrame();
+        
+        // Precise FPS timing system is now active
 
         // Optimized render loop is now active
 
@@ -392,6 +406,12 @@
                         log('Stream finished.');
                     }
                     setMusetalkStatusOk(`Stream ended. Total frames: ${totalFramesReceived}, Played: ${totalFramesPlayed}`);
+                    
+                    // Clean up timer when stream ends
+                    if (frameTimer) {
+                        clearTimeout(frameTimer);
+                        frameTimer = null;
+                    }
                     break;
                 }
 
@@ -452,6 +472,11 @@
             musetalkPlaceholderEl.style.display = 'flex';
         }
               } finally {
+        // Clean up timer
+        if (frameTimer) {
+            clearTimeout(frameTimer);
+            frameTimer = null;
+        }
         connecting = false;
         streamController = null;
       }
