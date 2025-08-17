@@ -293,12 +293,11 @@
         let playbackStarted = false;
         let audioStarted = false;
 
-        // Optimized playback system - start immediately when frames arrive
+        // Optimized playback system - get all frames first, then display them
         let frameQueue = [];
         let playbackQueue = [];
         let lastFrameTime = 0;
         let playbackStartTime = 0;
-        const frameDuration = 1000 / fps;
         let totalFramesReceived = 0;
         let totalFramesPlayed = 0;
         let streamReady = false; // Track when streaming is actually ready
@@ -317,27 +316,10 @@
             return -1;
         }
 
-                // Precise FPS-controlled playback using setTimeout
-        let frameTimer = null;
-        let nextFrameTime = 0;
-        
-        function scheduleNextFrame() {
-            if (!streamReady || playbackQueue.length === 0) {
-                // Continue checking for frames
-                frameTimer = setTimeout(scheduleNextFrame, 16); // ~60fps polling
-                return;
-            }
-            
-            const now = performance.now();
-            
-            // If this is the first frame, set the initial timing
-            if (nextFrameTime === 0) {
-                nextFrameTime = now;
-            }
-            
-            // Check if it's time for the next frame
-            if (now >= nextFrameTime) {
-                // Process the frame
+                // Simple render loop - just display frames as they're available
+        function renderLoop() {
+            if (streamReady && playbackQueue.length > 0) {
+                // Process one frame
                 const frameData = playbackQueue.shift();
                 const blob = new Blob([frameData], { type: 'image/jpeg' });
                 const imageUrl = URL.createObjectURL(blob);
@@ -353,7 +335,7 @@
                         if (t1_stopClickTime > 0) {
                             log(`>>> Total time to first frame (T3-T1): ${Math.round(t3_firstFrameTime - t1_stopClickTime)} ms`);
                         }
-                        log(`Playback started with ${playbackQueue.length} frames buffered at ${fps} FPS`);
+                        log(`Playback started with ${playbackQueue.length} frames buffered`);
                         if (!audioStarted) {
                             audioStarted = true;
                             playAnswer();
@@ -376,20 +358,16 @@
                 };
                 
                 img.src = imageUrl;
-                
-                // Schedule next frame at exact FPS interval
-                nextFrameTime += frameDuration;
             }
             
-            // Schedule next check
-            const timeUntilNextFrame = Math.max(1, nextFrameTime - performance.now());
-            frameTimer = setTimeout(scheduleNextFrame, timeUntilNextFrame);
+            // Continue rendering loop
+            requestAnimationFrame(renderLoop);
         }
         
-        // Start the precise timing loop
-        scheduleNextFrame();
+        // Start the render loop
+        requestAnimationFrame(renderLoop);
         
-        // Precise FPS timing system is now active
+        // Simple render loop is now active - gets all frames first, then displays them
 
         // Optimized render loop is now active
 
@@ -406,12 +384,6 @@
                         log('Stream finished.');
                     }
                     setMusetalkStatusOk(`Stream ended. Total frames: ${totalFramesReceived}, Played: ${totalFramesPlayed}`);
-                    
-                    // Clean up timer when stream ends
-                    if (frameTimer) {
-                        clearTimeout(frameTimer);
-                        frameTimer = null;
-                    }
                     break;
                 }
 
@@ -472,11 +444,6 @@
             musetalkPlaceholderEl.style.display = 'flex';
         }
               } finally {
-        // Clean up timer
-        if (frameTimer) {
-            clearTimeout(frameTimer);
-            frameTimer = null;
-        }
         connecting = false;
         streamController = null;
       }
