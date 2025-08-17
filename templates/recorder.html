@@ -316,10 +316,17 @@
             return -1;
         }
 
-                // Simple render loop - just display frames as they're available
-        function renderLoop() {
-            if (streamReady && playbackQueue.length > 0) {
-                // Process one frame
+                // FPS-controlled render loop
+        function renderLoop(timestamp) {
+            if (!lastFrameTime) lastFrameTime = timestamp;
+            
+            // Calculate time since last frame
+            const elapsed = timestamp - lastFrameTime;
+            const frameDuration = 1000 / fps; // Calculate frame duration based on target FPS
+            
+            // Process frames at target FPS rate when streaming is ready
+            if (streamReady && playbackQueue.length > 0 && elapsed >= frameDuration) {
+                // Process exactly one frame per FPS interval
                 const frameData = playbackQueue.shift();
                 const blob = new Blob([frameData], { type: 'image/jpeg' });
                 const imageUrl = URL.createObjectURL(blob);
@@ -335,7 +342,7 @@
                         if (t1_stopClickTime > 0) {
                             log(`>>> Total time to first frame (T3-T1): ${Math.round(t3_firstFrameTime - t1_stopClickTime)} ms`);
                         }
-                        log(`Playback started with ${playbackQueue.length} frames buffered`);
+                        log(`Playback started with ${playbackQueue.length} frames buffered at ${fps} FPS`);
                         if (!audioStarted) {
                             audioStarted = true;
                             playAnswer();
@@ -358,6 +365,9 @@
                 };
                 
                 img.src = imageUrl;
+                
+                // Update timing for next frame
+                lastFrameTime = timestamp;
             }
             
             // Continue rendering loop
