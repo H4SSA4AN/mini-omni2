@@ -24,6 +24,8 @@ class OmniChatServer(object):
 
         server.route("/chat", methods=["POST"])(self.chat)
 
+        # Proxy removed
+
         if run_app:
             server.run(host=ip, port=port, threaded=False)
         else:

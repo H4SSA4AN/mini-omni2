@@ -11,8 +11,8 @@
       --panel-border: #e5e7eb;
     }
     body { font-family: Arial, sans-serif; margin: 24px; background: #f8fafc; }
-    .container { max-width: 1400px; margin: 0 auto; }
-    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); align-items: start; }
+    .container { max-width: 1600px; margin: 0 auto; }
+    .layout { display: grid; grid-template-columns: 1fr 1.5fr; gap: var(--gap); align-items: start; }
     .panel { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 20px; min-height: 480px; }
     .panel h1, .panel h2 { margin: 0 0 12px; }
 
@@ -49,7 +49,7 @@
       <!-- Left Panel: Main controls/content -->
       <div class="panel" id="leftPanel">
         <h1>Audio Recorder</h1>
-        <p>Record your audio and it will be saved to the server when you press Stop.</p>
+        <p id="recordingDescription">Record your audio and it will be processed through Omni inference, then sent to MuseTalk.</p>
 
         <div id="health" class="status">Checking server...</div>
 
@@ -58,16 +58,44 @@
           <button id="stopBtn" disabled>Stop</button>
           <button id="playAnswerBtn" disabled>Play Answer</button>
         </div>
+        
+        <!-- Recording Mode Toggle -->
+        <div style="margin: 16px 0; padding: 12px; background: #f8f9fa; border-radius: 6px; border: 1px solid #e9ecef;">
+          <div style="margin-bottom: 8px; font-weight: bold; color: #495057;">Recording Mode:</div>
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+              <input type="radio" name="recordingMode" value="omni" checked>
+              <span>Omni Inference (AI generates response)</span>
+            </label>
+            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+              <input type="radio" name="recordingMode" value="raw">
+              <span>Record Self (Raw audio to MuseTalk)</span>
+            </label>
+            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+              <input type="radio" name="recordingMode" value="upload">
+              <span>Upload Audio File (Skip inference)</span>
+            </label>
+          </div>
+        </div>
 
-        <!-- Placeholder inputs (not wired yet) -->
-        <div class="placeholders" aria-label="Placeholder parameters (no function yet)">
+        <!-- File Upload Section (hidden by default) -->
+        <div id="fileUploadSection" style="display: none; margin: 16px 0; padding: 12px; background: #e8f4fd; border-radius: 6px; border: 1px solid #bee5eb;">
+          <div style="margin-bottom: 8px; font-weight: bold; color: #0c5460;">Upload Audio File:</div>
+          <input type="file" id="audioFileInput" accept="audio/*" style="margin-bottom: 8px; width: 100%;">
+          <button id="uploadFileBtn" style="background: #17a2b8; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;">
+            Upload & Send to MuseTalk
+          </button>
+        </div>
+
+        <!-- FPS and Batch Size inputs -->
+        <div class="placeholders" aria-label="Inference parameters">
           <div class="field">
-            <label for="fpsInput">FPS (placeholder)</label>
-            <input id="fpsInput" type="number" min="1" max="60" step="1" value="30" placeholder="30" />
+            <label for="fpsInput">FPS</label>
+            <input id="fpsInput" type="number" min="1" max="60" step="1" value="25" />
           </div>
           <div class="field">
-            <label for="batchInput">Batch Size (placeholder)</label>
-            <input id="batchInput" type="number" min="1" step="1" value="64" placeholder="64" />
+            <label for="batchInput">Batch Size</label>
+            <input id="batchInput" type="number" min="1" step="1" value="8" />
           </div>
         </div>
 
@@ -86,10 +114,19 @@
           <input id="musetalkUrl" type="text" placeholder="http://localhost:7860/health or full endpoint" />
         </div>
         <div class="controls" style="margin-top: 8px;">
-          <button id="checkMusetalkBtn">Check Connection</button>
+            <button id="checkMusetalkBtn">Check Connection</button>
         </div>
         <div id="musetalkStatus" class="status">Not checked</div>
-        <div class="placeholder" style="margin-top: 12px;">musetalk stream here</div>
+        <div class="placeholder" style="margin-top: 12px;">
+            <!-- Canvas for rendering frames -->
+            <canvas id="musetalkCanvas" width="960" height="720" style="max-width:100%; height:auto; background:#000; border-radius:8px; display:none;"></canvas>
+            <div id="musetalkPlaceholder" style="display:flex; align-items:center; justify-content:center; min-height:480px; color:#6b7280; border:2px dashed #cbd5e1; border-radius:8px; background:#f9fafb;">
+                <div style="text-align:center;">
+                    <div style="font-size:1.2em; margin-bottom:8px;">🎭 MuseTalk Avatar</div>
+                    <div style="font-size:0.9em;">Lip-synced video will appear here</div>
+                </div>
+            </div>
+        </div>
       </div>
     </div>
   </div>
@@ -123,6 +160,10 @@
     const musetalkUrlInput = document.getElementById('musetalkUrl');
     const checkMusetalkBtn = document.getElementById('checkMusetalkBtn');
     const musetalkStatusEl = document.getElementById('musetalkStatus');
+    const musetalkCanvas = document.getElementById('musetalkCanvas');
+    const musetalkPlaceholderEl = document.getElementById('musetalkPlaceholder');
+    let t1_stopClickTime = 0; // T1: Timestamp for when the user clicks stop. Shared across functions.
+    let t4_inferenceEndTime = 0; // T4: Timestamp for when inference finishes. Polled from server.
 
     function setMusetalkStatusOk(text) {
       musetalkStatusEl.textContent = text;
@@ -161,10 +202,11 @@
         const data = await resp.json();
         if (data.ok) {
           const ms = typeof data.elapsed_ms === 'number' ? `${data.elapsed_ms} ms` : 'N/A';
-          setMusetalkStatusOk(`Connected: ${data.url || url} [${data.status}] in ${ms}`);
+          const message = data.message || 'Health check successful';
+          setMusetalkStatusOk(`✅ ${message} - ${data.url} [${data.status}] in ${ms}`);
         } else {
-          const detail = data.tried && data.tried.length ? ` Tried: ${data.tried.map(t => t.url + (t.status ? `(${t.status})` : '')).join(', ')}` : '';
-          setMusetalkStatusErr('Connection failed.' + detail);
+          const message = data.message || data.error || 'unknown error';
+          setMusetalkStatusErr(`❌ ${message}`);
         }
       } catch (e) {
         setMusetalkStatusErr('Connection check error');
@@ -179,62 +221,372 @@
       if (saved) musetalkUrlInput.value = saved;
     })();
 
-    checkMusetalkBtn.addEventListener('click', checkMusetalkConnection);
+    checkMusetalkBtn.addEventListener('click', async () => {
+      await checkMusetalkConnection();
+      // Connect only after the user explicitly checks connection
+      await connectMusetalk();
+    });
+
+    // MJPEG streaming with MuseTalk server
+    let mjpegStream = null;
+    let connecting = false;
+
+    // This will hold the AbortController to cancel an ongoing fetch stream
+    let streamController = null;
+
+    async function connectMusetalk(fps = 25) {
+      if (connecting) return;
+      connecting = true;
+      setMusetalkStatusOk('Connecting to stream...');
+      log(`Connecting to stream for buffered playback at ${fps} FPS`);
+
+      const canvas = musetalkCanvas;
+      const ctx = canvas.getContext('2d');
+      canvas.style.display = 'block';
+      musetalkPlaceholderEl.style.display = 'none';
+
+      // Set canvas display size
+      const displayWidth = canvas.parentElement.clientWidth;
+      const displayHeight = (displayWidth / canvas.width) * canvas.height;
+      canvas.style.height = `${displayHeight}px`;
+
+      try {
+        streamController = new AbortController();
+        const signal = streamController.signal;
+
+        // Connect to server-side MJPEG stream composed from MuseTalk frames
+        const response = await fetch('/mjpeg_stream', { signal });
+        if (!response.ok) {
+          throw new Error(`Connection failed: ${response.status} ${response.statusText}`);
+        }
+        
+        log('Stream connected. Buffering frames...');
+        setMusetalkStatusOk('Connected. Buffering frames...');
+
+        const reader = response.body.getReader();
+        let buffer = new Uint8Array();
+        const SOI = new Uint8Array([0xFF, 0xD8]); // Start of Image
+        const EOI = new Uint8Array([0xFF, 0xD9]); // End of Image
+        let frameCount = 0;
+        let playbackStarted = false;
+        let audioStarted = false;
+
+        // Optimized playback system - get all frames first, then display them
+        let frameQueue = [];
+        let playbackQueue = [];
+        let lastFrameTime = 0;
+        let playbackStartTime = 0;
+        let totalFramesReceived = 0;
+        let totalFramesPlayed = 0;
+        let streamReady = false; // Track when streaming is actually ready
+
+        function findMarker(data, marker) {
+            for (let i = 0; i < data.length - marker.length + 1; i++) {
+                let found = true;
+                for (let j = 0; j < marker.length; j++) {
+                    if (data[i + j] !== marker[j]) {
+                        found = false;
+                        break;
+                    }
+                }
+                if (found) return i;
+            }
+            return -1;
+        }
+
+                // FPS-controlled render loop
+        function renderLoop(timestamp) {
+            if (!lastFrameTime) lastFrameTime = timestamp;
+            
+            // Calculate time since last frame
+            const elapsed = timestamp - lastFrameTime;
+            const frameDuration = 1000 / fps; // Calculate frame duration based on target FPS
+            
+            // Process frames at target FPS rate when streaming is ready
+            if (streamReady && playbackQueue.length > 0 && elapsed >= frameDuration) {
+                // Process exactly one frame per FPS interval
+                const frameData = playbackQueue.shift();
+                const blob = new Blob([frameData], { type: 'image/jpeg' });
+                const imageUrl = URL.createObjectURL(blob);
+                const img = new Image();
+
+                img.onload = () => {
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    URL.revokeObjectURL(imageUrl); // Clean up memory
+
+                    if (totalFramesPlayed === 0) {
+                        const t3_firstFrameTime = performance.now();
+                        playbackStartTime = t3_firstFrameTime;
+                        if (t1_stopClickTime > 0) {
+                            log(`>>> Total time to first frame (T3-T1): ${Math.round(t3_firstFrameTime - t1_stopClickTime)} ms`);
+                        }
+                        log(`Playback started with ${playbackQueue.length} frames buffered at ${fps} FPS`);
+                        if (!audioStarted) {
+                            audioStarted = true;
+                            playAnswer();
+                        }
+                    }
+
+                    totalFramesPlayed++;
+                    
+                    // Update status every 10 frames
+                    if (totalFramesPlayed % 10 === 0) {
+                        const totalElapsed = performance.now() - playbackStartTime;
+                        const actualFps = totalElapsed > 0 ? (totalFramesPlayed / (totalElapsed / 1000)).toFixed(1) : '0.0';
+                        setMusetalkStatusOk(`Playing: ${totalFramesPlayed} | Buffer: ${playbackQueue.length} | FPS: ${actualFps}/${fps}`);
+                    }
+                };
+                
+                img.onerror = () => {
+                    log(`Error loading image for frame ${totalFramesPlayed + 1}`);
+                    URL.revokeObjectURL(imageUrl);
+                };
+                
+                img.src = imageUrl;
+                
+                // Update timing for next frame
+                lastFrameTime = timestamp;
+            }
+            
+            // Continue rendering loop
+            requestAnimationFrame(renderLoop);
+        }
+        
+        // Start the render loop
+        requestAnimationFrame(renderLoop);
+        
+        // Simple render loop is now active - gets all frames first, then displays them
+
+        // Optimized render loop is now active
+
+        // Frame processing and buffering
+        async function processFrames() {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    const t5_streamEndTime = performance.now();
+                    if (t4_inferenceEndTime > 0) {
+                        log(`Stream display finished.`);
+                        log(`>>> Stream drain time (T5-T4): (See poll logs for T4)`);
+                    } else {
+                        log('Stream finished.');
+                    }
+                    setMusetalkStatusOk(`Stream ended. Total frames: ${totalFramesReceived}, Played: ${totalFramesPlayed}`);
+                    break;
+                }
+
+                // Add new data to buffer
+                const newBuffer = new Uint8Array(buffer.length + value.length);
+                newBuffer.set(buffer);
+                newBuffer.set(value, buffer.length);
+                buffer = newBuffer;
+
+                // Process all complete JPEGs in the buffer
+                while (true) {
+                    const soiIndex = findMarker(buffer, SOI);
+                    if (soiIndex === -1) break; // No start marker found, wait for more data
+
+                    const eoiIndex = findMarker(buffer.subarray(soiIndex), EOI);
+                    if (eoiIndex === -1) break; // No end marker found, wait for more data
+
+                    const frameData = buffer.subarray(soiIndex, soiIndex + eoiIndex + EOI.length);
+                    frameQueue.push(frameData);
+                    totalFramesReceived++;
+
+                    // Remove processed frame from buffer
+                    buffer = buffer.subarray(soiIndex + eoiIndex + EOI.length);
+                }
+
+                // Immediate playback logic: Start processing frames as soon as they arrive
+                if (!playbackStarted && frameQueue.length > 0) {
+                    playbackStarted = true;
+                    streamReady = true;
+                    log(`Stream started! Processing ${frameQueue.length} frames immediately...`);
+                    setMusetalkStatusOk(`Stream active! Processing frames at ${fps} FPS...`);
+                    
+                    // Immediately move all buffered frames to playback queue
+                    playbackQueue = [...frameQueue];
+                    frameQueue = [];
+                } else if (playbackStarted && streamReady) {
+                    // After playback starts, immediately add all new frames to playback queue
+                    // This ensures no delay in processing new batches
+                    while (frameQueue.length > 0) {
+                        playbackQueue.push(frameQueue.shift());
+                    }
+                } else if (!playbackStarted) {
+                    // Waiting for first frame
+                    setMusetalkStatusOk(`Waiting for first frame... (${frameQueue.length} received)`);
+                }
+            }
+        }
+        
+        await processFrames();
+
+              } catch (e) {
+        if (e.name === 'AbortError') {
+            log('Stream connection aborted for new recording.');
+        } else {
+            setMusetalkStatusErr('Stream failed: ' + e.message);
+            log('Error processing stream: ' + e.message);
+            canvas.style.display = 'none';
+            musetalkPlaceholderEl.style.display = 'flex';
+        }
+              } finally {
+        connecting = false;
+        streamController = null;
+      }
+    }
+
+    // Stream readiness: directly connect to local MJPEG stream at the requested FPS
+    async function pollForStreamReady(musetalkUrl) {
+      const inferenceFps = parseInt(document.getElementById('fpsInput').value || '25', 10);
+      log('Connecting to local MJPEG stream...');
+      connectMusetalk(inferenceFps);
+    }
+
+    // Persist URL but do not auto-connect
+    musetalkUrlInput.addEventListener('blur', () => {
+      localStorage.setItem('musetalkUrl', musetalkUrlInput.value);
+    });
 
     async function startRecording() {
+      log('Start Recording button clicked');
+      
+      // If a stream is in progress, abort it.
+      if (streamController) {
+          log('Aborting existing stream...');
+          streamController.abort();
+      }
+
+      // Reset the MuseTalk server state before starting a new session
+      const rawUrl = musetalkUrlInput.value;
+      if (rawUrl) {
+          const baseUrl = normalizeUrl(rawUrl).replace('/stream', '').replace('/health', '');
+          try {
+              log('Resetting MuseTalk server state...');
+              const proxyResetUrl = `/api/reset?target_url=${encodeURIComponent(baseUrl)}`;
+              await fetch(proxyResetUrl, { method: 'POST' });
+          } catch (e) {
+              log(`Could not reset MuseTalk server: ${e.message}`);
+          }
+      }
+
+      // Reset UI elements for the new recording session
+      clearLog();
+      setMusetalkStatusOk('Ready for new recording...');
+      musetalkCanvas.style.display = 'none';
+      musetalkPlaceholderEl.style.display = 'flex';
+      connecting = false;
+      t1_stopClickTime = 0;
+      answerUrl = '';
+      playAnswerBtn.disabled = true;
+      answerPlayer.src = '';
+
       try {
+        log('Requesting microphone access...');
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        log('Microphone access granted');
+        
         chunks = [];
         mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+        log('MediaRecorder created');
+        
         mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
         mediaRecorder.onstop = async () => {
           const blob = new Blob(chunks, { type: 'audio/webm' });
 
           clearLog();
-          const tUploadStart = performance.now();
+          log('Audio processing started...');
+          t1_stopClickTime = performance.now(); // T1: User clicks stop
 
           const uploadName = 'UserInput.webm';
           const formData = new FormData();
           formData.append('file', blob, uploadName);
           formData.append('mimeType', blob.type);
           formData.append('duration', ((Date.now() - startTime) / 1000).toFixed(2));
+          formData.append('musetalkUrl', musetalkUrlInput.value || '');
+          formData.append('fps', document.getElementById('fpsInput').value);
+          formData.append('batch_size', document.getElementById('batchInput').value);
+
+          // Check recording mode
+          const recordingMode = document.querySelector('input[name="recordingMode"]:checked').value;
+          const endpoint = recordingMode === 'raw' ? '/upload_raw_audio' : '/upload_audio';
 
           try {
-            const resp = await fetch('/upload_audio', { method: 'POST', body: formData });
+            const resp = await fetch(endpoint, { method: 'POST', body: formData });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = await resp.json();
 
-            const inferenceMs = data.metrics && typeof data.metrics.inference_ms === 'number' ? data.metrics.inference_ms : null;
-
-            if (data.answer && data.answer.answer_url) {
-              answerUrl = data.answer.answer_url;
-              await new Promise((resolve) => {
-                const onReady = () => { answerPlayer.removeEventListener('canplaythrough', onReady); resolve(); };
-                answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
-                answerPlayer.src = answerUrl + `?t=${Date.now()}`;
-              });
-              const totalDelayMs = Math.max(0, Math.round(performance.now() - tUploadStart));
-              if (typeof inferenceMs === 'number') log(`inference_time_ms: ${inferenceMs}`);
-              log(`total_delay_ms: ${totalDelayMs}`);
-              playAnswerBtn.disabled = false;
+            if (recordingMode === 'raw') {
+              // Raw audio mode - no inference, just forward to musetalk
+              log('Raw audio mode: Sending directly to MuseTalk...');
+              if (data.raw_audio && data.raw_audio.file_url) {
+                answerUrl = data.raw_audio.file_url;
+                await new Promise((resolve) => {
+                  const onReady = () => { answerPlayer.removeEventListener('canplaythrough', onReady); resolve(); };
+                  answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
+                  answerPlayer.src = answerUrl + `?t=${Date.now()}`;
+                });
+                const t2_serverResponseTime = performance.now();
+                log(`Raw audio processing time (T2-T1): ${Math.round(t2_serverResponseTime - t1_stopClickTime)} ms`);
+                
+                if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
+                  log('Raw audio sent to MuseTalk. Polling for stream...');
+                  // Connect to local MJPEG stream
+                  pollForStreamReady(musetalkUrlInput.value);
+                } else {
+                  const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
+                  setMusetalkStatusErr(`MuseTalk trigger failed: ${errorMsg}`);
+                }
+                playAnswerBtn.disabled = false;
+              }
             } else {
-              if (typeof inferenceMs === 'number') log(`inference_time_ms: ${inferenceMs}`);
-              log('total_delay_ms: N/A');
+              // Omni inference mode - original behavior
+              const inferenceMs = data.metrics && typeof data.metrics.inference_ms === 'number' ? data.metrics.inference_ms : null;
+
+              if (data.answer && data.answer.answer_url) {
+                answerUrl = data.answer.answer_url;
+                await new Promise((resolve) => {
+                  const onReady = () => { answerPlayer.removeEventListener('canplaythrough', onReady); resolve(); };
+                  answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
+                  answerPlayer.src = answerUrl + `?t=${Date.now()}`;
+                });
+                const t2_serverResponseTime = performance.now();
+                log(`Server processing time (T2-T1): ${Math.round(t2_serverResponseTime - t1_stopClickTime)} ms`);
+                
+                if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
+                  log('Audio processing complete. Polling for MuseTalk stream...');
+                  // Connect to local MJPEG stream
+                  pollForStreamReady(musetalkUrlInput.value);
+                } else {
+                  const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
+                  setMusetalkStatusErr(`MuseTalk trigger failed: ${errorMsg}`);
+                }
+                playAnswerBtn.disabled = false;
+              } else {
+                if (typeof inferenceMs === 'number') log(`inference_time_ms: ${inferenceMs}`);
+                log('total_delay_ms: N/A');
+              }
             }
           } catch (err) {
+            log(`Error in ${recordingMode} mode: ${err.message}`);
             log('inference_time_ms: N/A');
             log('total_delay_ms: N/A');
           }
         };
+        log('Starting recording...');
         mediaRecorder.start(250);
         startTime = Date.now();
         startBtn.disabled = true;
         stopBtn.disabled = false;
         playAnswerBtn.disabled = true;
+        log('Recording started successfully');
       } catch (err) {
         clearLog();
+        log(`Error starting recording: ${err.message}`);
         log('inference_time_ms: N/A');
         log('total_delay_ms: N/A');
+        console.error('Recording error:', err);
       }
     }
 
@@ -254,6 +606,129 @@
       }
       answerPlayer.play().catch(() => {});
     }
+
+    // Update UI based on recording mode
+    function updateRecordingModeUI() {
+      const recordingMode = document.querySelector('input[name="recordingMode"]:checked').value;
+      const descriptionEl = document.getElementById('recordingDescription');
+      const startBtn = document.getElementById('startBtn');
+      const fileUploadSection = document.getElementById('fileUploadSection');
+      const controlsSection = document.querySelector('.controls');
+      
+      if (recordingMode === 'raw') {
+        descriptionEl.textContent = 'Record your raw audio and send it directly to MuseTalk (no AI inference).';
+        startBtn.textContent = 'Start Recording (Raw)';
+        fileUploadSection.style.display = 'none';
+        controlsSection.style.display = 'flex';
+      } else if (recordingMode === 'upload') {
+        descriptionEl.textContent = 'Upload an audio file and send it directly to MuseTalk (no AI inference).';
+        startBtn.textContent = 'Start Recording';
+        fileUploadSection.style.display = 'block';
+        controlsSection.style.display = 'none';
+      } else {
+        descriptionEl.textContent = 'Record your audio and it will be processed through Omni inference, then sent to MuseTalk.';
+        startBtn.textContent = 'Start Recording';
+        fileUploadSection.style.display = 'none';
+        controlsSection.style.display = 'flex';
+      }
+    }
+
+    // Add event listeners for mode changes
+    document.querySelectorAll('input[name="recordingMode"]').forEach(radio => {
+      radio.addEventListener('change', updateRecordingModeUI);
+    });
+
+    // Initialize UI
+    updateRecordingModeUI();
+
+    // File upload handling
+    const uploadFileBtn = document.getElementById('uploadFileBtn');
+    const audioFileInput = document.getElementById('audioFileInput');
+
+    async function uploadAudioFile() {
+      const file = audioFileInput.files[0];
+      if (!file) {
+        log('Please select an audio file first.');
+        return;
+      }
+
+      const musetalkUrl = musetalkUrlInput.value.trim();
+      if (!musetalkUrl) {
+        log('Please enter a MuseTalk URL first.');
+        return;
+      }
+
+      // If a stream is in progress, abort it.
+      if (streamController) {
+        streamController.abort();
+      }
+
+      // Reset the MuseTalk server state before starting a new session
+      const rawUrl = musetalkUrlInput.value;
+      if (rawUrl) {
+        const baseUrl = normalizeUrl(rawUrl).replace('/stream', '').replace('/health', '');
+        try {
+          log('Resetting MuseTalk server state...');
+          const proxyResetUrl = `/api/reset?target_url=${encodeURIComponent(baseUrl)}`;
+          await fetch(proxyResetUrl, { method: 'POST' });
+        } catch (e) {
+          log(`Could not reset MuseTalk server: ${e.message}`);
+        }
+      }
+
+      // Reset UI elements for the new upload session
+      clearLog();
+      setMusetalkStatusOk('Processing audio file...');
+      musetalkCanvas.style.display = 'none';
+      musetalkPlaceholderEl.style.display = 'flex';
+      connecting = false;
+      t1_stopClickTime = 0;
+      answerUrl = '';
+      playAnswerBtn.disabled = true;
+      answerPlayer.src = '';
+
+      log('Audio file upload started...');
+      t1_stopClickTime = performance.now(); // T1: User clicks upload
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('musetalkUrl', musetalkUrl);
+      formData.append('fps', document.getElementById('fpsInput').value);
+      formData.append('batch_size', document.getElementById('batchInput').value);
+
+      try {
+        const resp = await fetch('/upload_audio_file', { method: 'POST', body: formData });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+
+        log('Audio file uploaded successfully.');
+        if (data.uploaded_audio && data.uploaded_audio.file_url) {
+          answerUrl = data.uploaded_audio.file_url;
+          await new Promise((resolve) => {
+            const onReady = () => { answerPlayer.removeEventListener('canplaythrough', onReady); resolve(); };
+            answerPlayer.addEventListener('canplaythrough', onReady, { once: true });
+            answerPlayer.src = answerUrl + `?t=${Date.now()}`;
+          });
+          const t2_serverResponseTime = performance.now();
+          log(`File upload processing time (T2-T1): ${Math.round(t2_serverResponseTime - t1_stopClickTime)} ms`);
+          
+          if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
+            log('Audio file sent to MuseTalk. Polling for stream...');
+            // Connect to local MJPEG stream
+            pollForStreamReady(musetalkUrl);
+          } else {
+            const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
+            setMusetalkStatusErr(`MuseTalk trigger failed: ${errorMsg}`);
+          }
+          playAnswerBtn.disabled = false;
+        }
+      } catch (err) {
+        log(`Error uploading audio file: ${err.message}`);
+        setMusetalkStatusErr(`Upload failed: ${err.message}`);
+      }
+    }
+
+    uploadFileBtn.addEventListener('click', uploadAudioFile);
 
     startBtn.addEventListener('click', startRecording);
     stopBtn.addEventListener('click', stopRecording);
