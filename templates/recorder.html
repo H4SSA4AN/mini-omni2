@@ -194,7 +194,7 @@
       musetalkStatusEl.className = 'status';
       musetalkStatusEl.textContent = 'Checking...';
       try {
-        const resp = await fetch('/proxy/check', {
+        const resp = await fetch('/check_musetalk', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url })
@@ -234,29 +234,8 @@
     // This will hold the AbortController to cancel an ongoing fetch stream
     let streamController = null;
 
-    function ensureStreamUrl(raw) {
-      const u = normalizeUrl(raw);
-      if (!u) return '';
-      // If user pasted health or root, default to /stream
-      try {
-        const url = new URL(u);
-        if (url.pathname === '/' || url.pathname === '/health') {
-          url.pathname = '/stream';
-        }
-        return url.toString();
-      } catch {
-        return '';
-      }
-    }
-
     async function connectMusetalk(fps = 25) {
       if (connecting) return;
-      const raw = musetalkUrlInput.value;
-      const streamUrl = ensureStreamUrl(raw);
-      if (!streamUrl) {
-        setMusetalkStatusErr('Please enter a valid MuseTalk server URL');
-        return;
-      }
       connecting = true;
       setMusetalkStatusOk('Connecting to stream...');
       log(`Connecting to stream for buffered playback at ${fps} FPS`);
@@ -275,9 +254,8 @@
         streamController = new AbortController();
         const signal = streamController.signal;
 
-        // Use proxy for streaming
-        const proxyUrl = `/api/stream?target_url=${encodeURIComponent(streamUrl)}`;
-        const response = await fetch(proxyUrl, { signal });
+        // Connect to server-side MJPEG stream composed from MuseTalk frames
+        const response = await fetch('/mjpeg_stream', { signal });
         if (!response.ok) {
           throw new Error(`Connection failed: ${response.status} ${response.statusText}`);
         }
@@ -459,54 +437,11 @@
       }
     }
 
-    // Poll for stream readiness
+    // Stream readiness: directly connect to local MJPEG stream at the requested FPS
     async function pollForStreamReady(musetalkUrl) {
-      const baseUrl = normalizeUrl(musetalkUrl).replace('/stream', '').replace('/health', '');
-      const statusUrl = baseUrl + '/stream_status';
-      
-      let attempts = 0;
-      const maxAttempts = 120; // 60 seconds with 500ms intervals
-      let streamConnected = false;
-      
-      const poll = async () => {
-        if (streamConnected) return; // Stop polling once connected
-
-        try {
-          const proxyStatusUrl = `/api/stream_status?target_url=${encodeURIComponent(baseUrl)}`;
-          const response = await fetch(proxyStatusUrl);
-          const data = await response.json();
-
-          // Continuously update T4 when available
-          if (data.inference_end_time) {
-              t4_inferenceEndTime = data.inference_end_time;
-              log(`(Poll) Inference finished at server time: ${t4_inferenceEndTime}`);
-          }
-          
-          if (!streamConnected && (data.inference_triggered || data.stream_ready)) {
-            streamConnected = true; // Prevent multiple connection attempts
-            log('MuseTalk inference triggered, connecting to stream immediately...');
-            const inferenceFps = data.fps || 25; // Use server FPS, fallback to 25
-            log(`Server is generating frames at ${inferenceFps} FPS.`);
-            connectMusetalk(inferenceFps);
-            // Don't return, allow polling to continue for T4
-          }
-          
-          attempts++;
-          if (attempts < maxAttempts) {
-            setTimeout(poll, 500);
-          } else {
-            log('MuseTalk polling stopped after 60 seconds');
-          }
-        } catch (error) {
-          log('Error polling stream status: ' + error.message);
-          attempts++;
-          if (attempts < maxAttempts) {
-            setTimeout(poll, 1000);
-          }
-        }
-      };
-      
-      poll();
+      const inferenceFps = parseInt(document.getElementById('fpsInput').value || '25', 10);
+      log('Connecting to local MJPEG stream...');
+      connectMusetalk(inferenceFps);
     }
 
     // Persist URL but do not auto-connect
@@ -597,6 +532,7 @@
                 
                 if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
                   log('Raw audio sent to MuseTalk. Polling for stream...');
+                  // Connect to local MJPEG stream
                   pollForStreamReady(musetalkUrlInput.value);
                 } else {
                   const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
@@ -620,6 +556,7 @@
                 
                 if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
                   log('Audio processing complete. Polling for MuseTalk stream...');
+                  // Connect to local MJPEG stream
                   pollForStreamReady(musetalkUrlInput.value);
                 } else {
                   const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';
@@ -777,6 +714,7 @@
           
           if (data.forwarded_to_musetalk && data.forwarded_to_musetalk.ok) {
             log('Audio file sent to MuseTalk. Polling for stream...');
+            // Connect to local MJPEG stream
             pollForStreamReady(musetalkUrl);
           } else {
             const errorMsg = data.forwarded_to_musetalk ? data.forwarded_to_musetalk.error : 'unknown error';

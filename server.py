@@ -10,7 +10,6 @@ import tempfile
 import traceback
 from flask import Flask, Response, stream_with_context
 from inference_vision import OmniVisionInference
-from proxy import create_proxy_routes
 
 
 class OmniChatServer(object):
@@ -25,8 +24,7 @@ class OmniChatServer(object):
 
         server.route("/chat", methods=["POST"])(self.chat)
 
-        # Add proxy routes
-        self.proxy = create_proxy_routes(server)
+        # Proxy removed
 
         if run_app:
             server.run(host=ip, port=port, threaded=False)

@@ -164,8 +164,15 @@ class ReverseProxy:
             parsed = urlparse(target_url)
             base_url = urlunparse((parsed.scheme or 'http', parsed.netloc, '', '', '', ''))
             
-            # Test the /health endpoint
-            health_url = f"{base_url}/health"
+            # Build our public base for MuseTalk to register stream callbacks
+            xf_proto = request.headers.get('X-Forwarded-Proto')
+            xf_host = request.headers.get('X-Forwarded-Host')
+            scheme = xf_proto or request.scheme
+            host = xf_host or request.host
+            public_base = f"{scheme}://{host}"
+
+            # Test the /health endpoint with stream_base param
+            health_url = f"{base_url}/health?stream_base={public_base}"
             start_time = time.time()
             
             response = self.session.get(health_url, timeout=10)

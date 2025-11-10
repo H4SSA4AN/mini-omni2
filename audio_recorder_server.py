@@ -15,8 +15,11 @@ import time
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template, send_from_directory, abort
 from flask_cors import CORS
+import base64
+import json
+import logging
+import socket
 import requests
-from proxy import create_proxy_routes
 
 try:
     from pydub import AudioSegment
@@ -38,14 +41,13 @@ import shutil
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app)
 
-# Add proxy routes
-proxy_instance = create_proxy_routes(app)
-
 BASE_DIR = Path(__file__).parent
 RECORDINGS_DIR = BASE_DIR / "recordings"
 ANSWERS_DIR = BASE_DIR / "answers"
+UPLOADS_DIR = BASE_DIR / "uploads"
 RECORDINGS_DIR.mkdir(exist_ok=True)
 ANSWERS_DIR.mkdir(exist_ok=True)
+UPLOADS_DIR.mkdir(exist_ok=True)
 
 # Globals for Mini Omni 2 model
 OMNI_INITIALIZED = False
@@ -56,6 +58,18 @@ OMNI_TOKENIZER = None
 OMNI_SNAC = None
 OMNI_WHISPER = None
 OMNI_CKPT = str(BASE_DIR / "checkpoint")
+
+# Config and state (integrated from aio_app.py)
+MAX_AUDIO_SIZE = 100 * 1024 * 1024  # 100MB
+MUSETALK_URL = os.getenv('MUSETALK_URL', 'http://localhost:8085')
+
+# Simple in-memory frame buffer (for NDJSON frames posted by MuseTalk)
+frame_buffer = []
+processing_complete = False
+start_signal_received = False
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 def _clear_dir(dir_path: Path) -> None:
@@ -114,8 +128,8 @@ def _normalize_musetalk_start_url(url: str) -> str:
 
 def _forward_answer_and_trigger_inference(answer_path: Path, musetalk_url: str, fps: int, batch_size: int) -> dict:
     """
-    1. POST the generated Answer.wav to MuseTalk server's /upload_answer.
-    2. POST to MuseTalk server's /start to trigger inference with custom params.
+    POST the generated Answer.wav to MuseTalk server's /process with required multipart form fields.
+    Fields: audio (file), stream_url (callback), fps, batch_size, bbox_shift.
     """
     try:
         # Normalize the base URL (remove any paths like /stream, /health, etc.)
@@ -124,26 +138,46 @@ def _forward_answer_and_trigger_inference(answer_path: Path, musetalk_url: str, 
         base_url = urlunparse((parsed.scheme or 'http', parsed.netloc, '', '', '', ''))
         print(f"Original musetalk_url: {musetalk_url}")
         print(f"Normalized base_url: {base_url}")
-        
-        # Step 1: Upload the audio file directly to MuseTalk
-        upload_url = f"{base_url}/upload_answer"
-        files = {'file': ('Answer.wav', open(answer_path, 'rb'), 'audio/wav')}
-        print(f"Upload URL: {upload_url}")
-        upload_resp = requests.post(upload_url, files=files, timeout=10)
-        
-        if not upload_resp.ok:
-            return {"ok": False, "step": "upload", "status": upload_resp.status_code, "text": upload_resp.text}
-        
-        # Step 2: Trigger inference with parameters directly to MuseTalk
-        start_url = f"{base_url}/start"
-        payload = {"fps": fps, "batch_size": batch_size}
-        print(f"Start URL: {start_url}")
-        start_resp = requests.post(start_url, json=payload, timeout=10)
 
-        if not start_resp.ok:
-            return {"ok": False, "step": "start", "status": start_resp.status_code, "text": start_resp.text}
-            
-        return {"ok": True, "upload_response": upload_resp.json(), "start_response": start_resp.json()}
+        # Build process URL
+        process_url = f"{base_url}/process"
+
+        # Build a public callback URL for MuseTalk to POST frames back to this app
+        xf_proto = request.headers.get('X-Forwarded-Proto')
+        xf_host = request.headers.get('X-Forwarded-Host')
+        scheme = xf_proto or request.scheme
+        host = xf_host or request.host
+        stream_url = f"{scheme}://{host}/stream_frames"
+
+        # Prepare multipart form-data and send
+        print(f"Process URL: {process_url}")
+        print(f"Callback stream_url: {stream_url}")
+        with open(answer_path, 'rb') as fh:
+            files = {
+                # Use actual filename and content type based on extension
+                'audio': (
+                    answer_path.name,
+                    fh,
+                    'audio/mpeg' if answer_path.suffix.lower() == '.mp3' else 'audio/wav'
+                )
+            }
+            data = {
+                'stream_url': stream_url,
+                'fps': str(int(fps)),
+                'batch_size': str(int(batch_size)),
+                'bbox_shift': '0'
+            }
+            resp = requests.post(process_url, files=files, data=data, timeout=120)
+
+            if not resp.ok:
+                return {"ok": False, "step": "process", "status": resp.status_code, "text": resp.text}
+
+            # Try to parse JSON response; fall back to text
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {"text": resp.text}
+            return {"ok": True, "process_response": payload}
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -170,7 +204,119 @@ def index():
     return render_template("recorder.html")
 
 
+@app.route("/save_audio", methods=["POST"])
+def save_audio_handler():
+    """Accept base64 audio JSON and forward processed audio to MuseTalk /process."""
+    try:
+        if request.content_length and request.content_length > MAX_AUDIO_SIZE:
+            return jsonify({'error': 'Request too large'}), 413
+
+        data = request.get_json(silent=True) or {}
+        audio_data = data.get('audio_data')
+        fps = str(data.get('fps', '25'))
+        batch_size = str(data.get('batch_size', '20'))
+        musetalk_base_url = MUSETALK_URL
+        mode = (data.get('mode') or 'pipeline').strip().lower()
+
+        if not audio_data:
+            return jsonify({'error': 'No audio data received'}), 400
+
+        if isinstance(audio_data, str) and audio_data.startswith('data:audio/wav;base64,'):
+            audio_data = audio_data.split(',', 1)[1]
+
+        try:
+            audio_bytes = base64.b64decode(audio_data)
+        except Exception as e:
+            return jsonify({'error': f'Invalid audio data: {e}'}), 400
+
+        if len(audio_bytes) > MAX_AUDIO_SIZE:
+            return jsonify({'error': 'Audio file too large'}), 413
+
+        input_wav_path = UPLOADS_DIR / 'input.wav'
+        with open(input_wav_path, 'wb') as f:
+            f.write(audio_bytes)
+        saved_at = datetime.datetime.now().isoformat()
+
+        # Prepare answer audio (try MP3 via pydub; fallback to WAV)
+        answer_path = UPLOADS_DIR / 'answer.mp3'
+        answer_filename = 'answer.mp3'
+        answer_content_type = 'audio/mpeg'
+        try:
+            if PYDUB_AVAILABLE and input_wav_path.exists():
+                seg = AudioSegment.from_file(input_wav_path)
+                seg = seg.set_channels(1).set_frame_rate(24000)
+                try:
+                    seg.export(answer_path, format="mp3")
+                except Exception:
+                    answer_path = input_wav_path
+                    answer_filename = 'input.wav'
+                    answer_content_type = 'audio/wav'
+            else:
+                answer_path = input_wav_path
+                answer_filename = 'input.wav'
+                answer_content_type = 'audio/wav'
+        except Exception:
+            answer_path = input_wav_path
+            answer_filename = 'input.wav'
+            answer_content_type = 'audio/wav'
+
+        # Build MuseTalk /process endpoint
+        musetalk_base_url = str(musetalk_base_url).strip()
+        if musetalk_base_url.endswith('/'):
+            musetalk_base_url = musetalk_base_url[:-1]
+        if not (musetalk_base_url.startswith('http://') or musetalk_base_url.startswith('https://')):
+            musetalk_base_url = 'http://' + musetalk_base_url
+        musetalk_url = musetalk_base_url + '/process'
+
+        # Build callback URL
+        xf_proto = request.headers.get('X-Forwarded-Proto')
+        xf_host = request.headers.get('X-Forwarded-Host')
+        scheme = xf_proto or request.scheme
+        host = xf_host or request.host
+        stream_url = f"{scheme}://{host}/stream_frames"
+
+        files = {
+            'audio': (answer_filename, open(answer_path, 'rb'), answer_content_type)
+        }
+        form = {
+            'stream_url': stream_url,
+            'fps': fps,
+            'batch_size': batch_size,
+            'bbox_shift': '0'
+        }
+
+        resp = None
+        try:
+            resp = requests.post(musetalk_url, files=files, data=form, timeout=120)
+            musetalk_ok = resp.ok
+            try:
+                musetalk_payload = resp.json()
+            except Exception:
+                musetalk_payload = {'text': resp.text if resp is not None else ''}
+        finally:
+            try:
+                files['audio'][1].close()
+            except Exception:
+                pass
+
+        return jsonify({
+            'success': musetalk_ok,
+            'message': 'Answer audio forwarded to MuseTalk',
+            'musetalk_response': musetalk_payload,
+            'stream_url': stream_url,
+            'saved_at': saved_at,
+            'transcript': '',
+            'answer': '',
+            'answer_audio_path': str(answer_path),
+            'answer_audio_url': f"{scheme}://{host}/uploads/{answer_filename}",
+        }), 200 if musetalk_ok else 502
+
+    except Exception as e:
+        print(f"[Mini-Omni] save_audio error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 def _run_a1a2_inference(user_wav: Path) -> dict:
+    """Run Mini-Omni inference and write Answer.wav into ANSWERS_DIR."""
     _init_omni()
     _clear_dir(ANSWERS_DIR)
     mel, leng = omni_load_audio(str(user_wav))
@@ -209,23 +355,44 @@ def _run_a1a2_inference(user_wav: Path) -> dict:
 
 @app.route("/check_musetalk", methods=["POST"])
 def check_musetalk():
-    """This endpoint is now deprecated - use /proxy/check instead"""
+    """Directly check MuseTalk health without proxy; returns status and diagnostics."""
     try:
         data = request.get_json(silent=True) or {}
         base_url = (data.get("url") or "").strip()
         if not base_url:
             return jsonify({"ok": False, "error": "missing url"}), 400
 
-        # Use the proxy to check the connection
-        proxy_url = "/proxy/check"
-        proxy_data = {"url": base_url}
-        resp = requests.post(proxy_url, json=proxy_data, timeout=10)
-        
-        if resp.ok:
-            return resp.json(), 200
-        else:
-            return jsonify({"ok": False, "error": "Proxy check failed"}), 500
-            
+        # Normalize base URL
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(base_url)
+        musetalk_base_url = urlunparse((parsed.scheme or 'http', parsed.netloc or parsed.path, '', '', '', ''))
+
+        # Build health URL with this app's public base
+        xf_proto = request.headers.get('X-Forwarded-Proto')
+        xf_host = request.headers.get('X-Forwarded-Host')
+        scheme = xf_proto or request.scheme
+        host = xf_host or request.host
+        public_base = f"{scheme}://{host}"
+        url = musetalk_base_url.rstrip('/') + '/health' + f"?stream_base={public_base}"
+
+        # Perform GET
+        try:
+            resp = requests.get(url, headers={'User-Agent': 'AvatarPageProbe/1.0'}, timeout=5)
+            ct = resp.headers.get('Content-Type', '')
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text
+            return jsonify({
+                'ok': resp.status_code == 200,
+                'status': resp.status_code,
+                'url': url,
+                'content_type': ct,
+                'body': body,
+            }), 200 if resp.status_code == 200 else 502
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e), 'url': url}), 504
+
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -240,7 +407,7 @@ def upload_audio():
 
     mime_type = request.form.get("mimeType", "")
     duration = request.form.get("duration", "")
-    musetalk_url = request.form.get("musetalkUrl", "").strip()
+    musetalk_url = (request.form.get("musetalkUrl", "") or MUSETALK_URL).strip()
     try:
         fps = int(request.form.get("fps", 25))
         batch_size = int(request.form.get("batch_size", 8))
@@ -294,8 +461,20 @@ def upload_audio():
     forward_info = None
     if musetalk_url:
         try:
+            # Convert Omni Answer.wav to MP3 for MuseTalk, fallback to WAV
+            src_wav = Path(inference_result["answer_path"])
+            mp3_path = ANSWERS_DIR / "Answer.mp3"
+            use_path = src_wav
+            if PYDUB_AVAILABLE and src_wav.exists():
+                try:
+                    seg = AudioSegment.from_file(src_wav)
+                    seg = seg.set_channels(1).set_frame_rate(24000)
+                    seg.export(mp3_path, format="mp3")
+                    use_path = mp3_path
+                except Exception:
+                    use_path = src_wav
             forward_info = _forward_answer_and_trigger_inference(
-                Path(inference_result["answer_path"]), 
+                use_path,
                 musetalk_url,
                 fps,
                 batch_size
@@ -333,7 +512,7 @@ def upload_raw_audio():
 
     mime_type = request.form.get("mimeType", "")
     duration = request.form.get("duration", "")
-    musetalk_url = request.form.get("musetalkUrl", "").strip()
+    musetalk_url = (request.form.get("musetalkUrl", "") or MUSETALK_URL).strip()
     try:
         fps = int(request.form.get("fps", 25))
         batch_size = int(request.form.get("batch_size", 8))
@@ -345,27 +524,28 @@ def upload_raw_audio():
         return jsonify({"error": "MuseTalk URL is required for raw audio recording"}), 400
 
     _clear_dir(ANSWERS_DIR)
-    wav_path = ANSWERS_DIR / "Answer.wav"
+    mp3_path = ANSWERS_DIR / "Answer.mp3"
 
-    is_wav_upload = (mime_type.lower() == "audio/wav") or audio_file.filename.lower().endswith(".wav")
-    if is_wav_upload:
-        audio_file.save(wav_path)
+    file_ext = audio_file.filename.split(".")[-1].lower() if "." in audio_file.filename else ""
+    is_mp3_upload = (mime_type.lower() == "audio/mpeg") or audio_file.filename.lower().endswith(".mp3")
+    if is_mp3_upload:
+        audio_file.save(mp3_path)
     else:
+        # Convert input to MP3 if possible
         if not PYDUB_AVAILABLE:
             return jsonify({
-                "error": "Conversion to WAV requires pydub. Please install pydub and ffmpeg.",
+                "error": "Conversion to MP3 requires pydub. Please install pydub and ffmpeg.",
                 "hint": "pip install pydub and ensure ffmpeg is in PATH"
             }), 500
-        temp_ext = audio_file.filename.split(".")[-1].lower() if "." in audio_file.filename else "webm"
-        temp_input = ANSWERS_DIR / f"temp_input.{temp_ext}"
+        temp_input = ANSWERS_DIR / f"temp_input.{file_ext or 'bin'}"
         audio_file.save(temp_input)
         try:
             seg = AudioSegment.from_file(temp_input)
             seg = seg.set_channels(1).set_frame_rate(24000)
-            seg.export(wav_path, format="wav")
+            seg.export(mp3_path, format="mp3")
         except Exception as e:
             return jsonify({
-                "error": f"Failed to convert to WAV: {e}",
+                "error": f"Failed to convert to MP3: {e}",
                 "hint": "Ensure ffmpeg is installed and available in PATH"
             }), 500
         finally:
@@ -375,13 +555,13 @@ def upload_raw_audio():
                 if temp_input.exists():
                     temp_input.unlink()
 
-    file_size = wav_path.stat().st_size if wav_path.exists() else 0
+    file_size = mp3_path.stat().st_size if mp3_path.exists() else 0
 
     # Forward the raw audio directly to MuseTalk server
     forward_info = None
     try:
         forward_info = _forward_answer_and_trigger_inference(
-            wav_path, 
+            mp3_path, 
             musetalk_url,
             fps,
             batch_size
@@ -392,10 +572,10 @@ def upload_raw_audio():
     return jsonify({
         "status": "saved",
         "raw_audio": {
-            "filename": "Answer.wav",
-            "file_path": str(wav_path),
-            "file_url": "/answers/Answer.wav",
-            "mime_type": "audio/wav",
+            "filename": "Answer.mp3",
+            "file_path": str(mp3_path),
+            "file_url": "/answers/Answer.mp3",
+            "mime_type": "audio/mpeg",
             "duration": duration,
             "size_bytes": file_size,
         },
@@ -421,38 +601,37 @@ def upload_audio_file():
         fps = 25
         batch_size = 8
 
+    if not musetalk_url and not MUSETALK_URL:
+        return jsonify({"error": "MuseTalk URL is required (form musetalkUrl or env MUSETALK_URL)"}), 400
     if not musetalk_url:
-        return jsonify({"error": "MuseTalk URL is required for audio file upload"}), 400
+        musetalk_url = MUSETALK_URL
 
     _clear_dir(ANSWERS_DIR)
-    wav_path = ANSWERS_DIR / "Answer.wav"
+    mp3_path = ANSWERS_DIR / "Answer.mp3"
 
     # Get file extension and mime type
     file_ext = audio_file.filename.split(".")[-1].lower() if "." in audio_file.filename else ""
     mime_type = audio_file.content_type or ""
     
-    # Check if it's already a WAV file
-    is_wav_upload = (mime_type.lower() == "audio/wav" or 
-                    file_ext == "wav" or 
-                    audio_file.filename.lower().endswith(".wav"))
-    
-    if is_wav_upload:
-        audio_file.save(wav_path)
+    # Save or convert to MP3
+    is_mp3_upload = (mime_type.lower() == "audio/mpeg" or audio_file.filename.lower().endswith(".mp3"))
+    if is_mp3_upload:
+        audio_file.save(mp3_path)
     else:
         if not PYDUB_AVAILABLE:
             return jsonify({
-                "error": "Conversion to WAV requires pydub. Please install pydub and ffmpeg.",
+                "error": "Conversion to MP3 requires pydub. Please install pydub and ffmpeg.",
                 "hint": "pip install pydub and ensure ffmpeg is in PATH"
             }), 500
-        temp_input = ANSWERS_DIR / f"temp_input.{file_ext}"
+        temp_input = ANSWERS_DIR / f"temp_input.{file_ext or 'bin'}"
         audio_file.save(temp_input)
         try:
             seg = AudioSegment.from_file(temp_input)
             seg = seg.set_channels(1).set_frame_rate(24000)
-            seg.export(wav_path, format="wav")
+            seg.export(mp3_path, format="mp3")
         except Exception as e:
             return jsonify({
-                "error": f"Failed to convert to WAV: {e}",
+                "error": f"Failed to convert to MP3: {e}",
                 "hint": "Ensure ffmpeg is installed and available in PATH"
             }), 500
         finally:
@@ -462,13 +641,13 @@ def upload_audio_file():
                 if temp_input.exists():
                     temp_input.unlink()
 
-    file_size = wav_path.stat().st_size if wav_path.exists() else 0
+    file_size = mp3_path.stat().st_size if mp3_path.exists() else 0
 
     # Forward the audio file directly to MuseTalk server
     forward_info = None
     try:
         forward_info = _forward_answer_and_trigger_inference(
-            wav_path, 
+            mp3_path, 
             musetalk_url,
             fps,
             batch_size
@@ -479,11 +658,11 @@ def upload_audio_file():
     return jsonify({
         "status": "saved",
         "uploaded_audio": {
-            "filename": "Answer.wav",
+            "filename": "Answer.mp3",
             "original_filename": audio_file.filename,
-            "file_path": str(wav_path),
-            "file_url": "/answers/Answer.wav",
-            "mime_type": "audio/wav",
+            "file_path": str(mp3_path),
+            "file_url": "/answers/Answer.mp3",
+            "mime_type": "audio/mpeg",
             "size_bytes": file_size,
         },
         "forwarded_to_musetalk": forward_info,
@@ -528,6 +707,254 @@ def musetalk_stream_ready():
             return jsonify({"ok": False, "error": "Invalid notification data"}), 400
     except Exception as e:
         print(f"[Mini-Omni] Error handling stream notification: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/clear_buffer", methods=["GET"])
+def clear_buffer_handler():
+    """Clear frame buffer and reset flags."""
+    global frame_buffer, processing_complete, start_signal_received
+    frame_buffer.clear()
+    processing_complete = False
+    start_signal_received = False
+    return jsonify({'success': True})
+
+
+@app.route("/get_frame_buffer", methods=["GET"])
+def get_frame_buffer_handler():
+    """Return frames; supports incremental fetch via ?from_index=N"""
+    try:
+        from_index_q = request.args.get('from_index')
+        if from_index_q is not None:
+            try:
+                start = max(0, int(from_index_q))
+            except ValueError:
+                start = 0
+            frames_slice = frame_buffer[start:]
+            next_index = len(frame_buffer)
+        else:
+            frames_slice = frame_buffer
+            next_index = len(frame_buffer)
+        return jsonify({
+            'frames': frames_slice,
+            'buffer_size': len(frame_buffer),
+            'next_index': next_index,
+            'processing_complete': processing_complete,
+            'start_signal_received': start_signal_received,
+        })
+    except Exception as e:
+        print(f"[Mini-Omni] Error in get_frame_buffer: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route("/mjpeg_stream", methods=["GET"])
+def mjpeg_stream_handler():
+    """Serve MJPEG composed from buffered JPEG frames (base64)."""
+    from flask import Response
+    boundary = b'--frame\r\n'
+
+    def generate():
+        read_index = 0
+        first_written = False
+        # Wait for at least one frame or completion
+        while read_index >= len(frame_buffer) and not processing_complete:
+            time.sleep(0.02)
+        while True:
+            if read_index < len(frame_buffer):
+                entry = frame_buffer[read_index]
+                read_index += 1
+                try:
+                    frame_bytes = base64.b64decode(entry['frame_data'])
+                except Exception:
+                    continue
+                yield boundary
+                yield b'Content-Type: image/jpeg\r\n\r\n'
+                yield frame_bytes
+                yield b'\r\n'
+                if not first_written:
+                    print('[Mini-Omni] MJPEG: first frame written to client')
+                    first_written = True
+            else:
+                if processing_complete and read_index >= len(frame_buffer):
+                    print('[Mini-Omni] MJPEG: finished and all buffered frames flushed')
+                    break
+                time.sleep(0.01)
+        yield b'--frame--\r\n'
+
+    headers = {
+        'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+    }
+    return Response(generate(), status=200, headers=headers)
+
+
+@app.route("/config", methods=["GET"])
+def config_handler():
+    return jsonify({'musetalk_url': MUSETALK_URL})
+
+
+@app.route("/probe_musetalk", methods=["POST"])
+def probe_musetalk_handler():
+    """Build health URL with stream_base and attempt HTTP GET with basic diagnostics."""
+    try:
+        musetalk_base_url = MUSETALK_URL
+        musetalk_base_url = str(musetalk_base_url).strip()
+        if musetalk_base_url.endswith('/'):
+            musetalk_base_url = musetalk_base_url[:-1]
+        if not (musetalk_base_url.startswith('http://') or musetalk_base_url.startswith('https://')):
+            musetalk_base_url = 'http://' + musetalk_base_url
+
+        xf_proto = request.headers.get('X-Forwarded-Proto')
+        xf_host = request.headers.get('X-Forwarded-Host')
+        scheme = xf_proto or request.scheme
+        host = xf_host or request.host
+        public_base = f"{scheme}://{host}"
+        url = musetalk_base_url + '/health' + f"?stream_base={public_base}"
+
+        # DNS and TCP diagnostics
+        from urllib.parse import urlparse as _urlparse
+        parsed = _urlparse(url)
+        h = parsed.hostname
+        p = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        resolved_ips = []
+        try:
+            infos = socket.getaddrinfo(h, p, proto=socket.IPPROTO_TCP)
+            for family, _, _, _, sockaddr in infos:
+                ip = sockaddr[0]
+                if ip not in resolved_ips:
+                    resolved_ips.append(ip)
+        except Exception as e:
+            print(f"[Mini-Omni] DNS resolution failed for {h}: {e}")
+
+        tcp_ok = False
+        tcp_error = None
+        try:
+            with socket.create_connection((h, p), timeout=2):
+                tcp_ok = True
+        except Exception as e:
+            tcp_error = str(e)
+
+        # HTTP GET
+        try:
+            resp = requests.get(url, headers={'User-Agent': 'AvatarPageProbe/1.0'}, timeout=5)
+            ct = resp.headers.get('Content-Type', '')
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text
+            return jsonify({
+                'success': resp.status_code == 200,
+                'status': resp.status_code,
+                'url': url,
+                'resolved_ips': resolved_ips,
+                'tcp_connect_ok': tcp_ok,
+                'tcp_error': tcp_error,
+                'content_type': ct,
+                'body': body,
+            }), 200 if resp.status_code == 200 else 502
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'status': None,
+                'url': url,
+                'resolved_ips': resolved_ips,
+                'tcp_connect_ok': tcp_ok,
+                'tcp_error': tcp_error,
+                'error': str(e),
+            }), 504
+    except Exception as e:
+        print(f"[Mini-Omni] probe_musetalk error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route("/uploads/<path:filename>")
+def serve_upload(filename: str):
+    target = UPLOADS_DIR / filename
+    if not target.exists() or not target.is_file():
+        abort(404)
+    resp = send_from_directory(UPLOADS_DIR, filename)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+@app.route("/stream_frames", methods=["POST"])
+def stream_frames():
+    """Receive NDJSON lines with frames from MuseTalk."""
+    global frame_buffer, processing_complete, start_signal_received
+    try:
+        buf = b''
+        total_lines = 0
+        total_frames_received = 0
+
+        def process_line(line: str):
+            nonlocal total_lines, total_frames_received
+            total_lines += 1
+            line = line.strip()
+            if not line:
+                return
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning('Non-JSON line received; ignoring')
+                return
+
+            status = msg.get('status')
+            if status == 'start':
+                start_signal_received = True
+                logger.info('Start signal received')
+                return
+            if status == 'finished':
+                processing_complete = True
+                logger.info('Finished signal received')
+                return
+
+            frames = msg.get('frames', [])
+            # Normalize frames to a list for robustness
+            if frames is None:
+                frames_list = []
+            elif isinstance(frames, dict):
+                frames_list = [frames]
+            elif isinstance(frames, list):
+                frames_list = frames
+            else:
+                frames_list = []
+            if frames_list:
+                added = 0
+                last_num = None
+                for fr in frames_list:
+                    b64 = fr.get('frame_data') or fr.get('frame')
+                    if not b64:
+                        continue
+                    last_num = fr.get('frame_number', 0)
+                    frame_buffer.append({
+                        'frame_number': last_num,
+                        'frame_data': b64,
+                        'timestamp': datetime.datetime.now().isoformat(),
+                    })
+                    added += 1
+                total_frames_received += added
+                logger.info(f"Received {added} frames (last #{last_num}); buffer size={len(frame_buffer)}; total_frames_received={total_frames_received}")
+
+        # Read request data
+        chunk = request.get_data(cache=False, as_text=False, parse_form_data=False)
+        if chunk:
+            buf += chunk
+            while True:
+                idx = buf.find(b"\n")
+                if idx == -1:
+                    break
+                line_bytes = buf[:idx]
+                buf = buf[idx+1:]
+                process_line(line_bytes.decode('utf-8', errors='ignore'))
+
+        if buf:
+            process_line(buf.decode('utf-8', errors='ignore'))
+
+        return jsonify({'ok': True, 'lines': total_lines, 'frames': total_frames_received}), 200
+    except Exception as e:
+        logger.exception('stream_frames error')
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
